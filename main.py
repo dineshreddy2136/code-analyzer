@@ -1869,6 +1869,137 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     
     output.append("")
     
+    # Level 0: Target Function Definition
+    output.append("Level 0: Target Function Definition")
+    output.append("=" * 35)
+    
+    analyzer = deps.get('analyzer') or result.get('analyzer')
+    target_func_name = None
+    
+    # Find the target function name from multiple sources
+    if deps and not deps.get('error'):
+        # Method 1: Try to find the root node (function with no incoming dependencies)
+        edges = deps.get('edges', {})
+        if edges:
+            all_targets = set()
+            for targets in edges.values():
+                all_targets.update(targets)
+            
+            roots = set(edges.keys()) - all_targets
+            if roots:
+                target_func_name = sorted(list(roots))[0]  # Get deterministic root
+        
+        # Method 2: Get the function that was analyzed (should be in user_defined_order)
+        if not target_func_name and deps.get('user_defined_order'):
+            # The analyzed function might not be in the dependency chain if it has no internal dependencies
+            # So we need to look at the original analysis start point
+            pass
+    
+    # Method 3: Fallback to the function_name from function_found
+    if not target_func_name:
+        target_func_name = func_info.get('function_name')
+    
+    # Method 4: Try to find the function by searching the analyzer's function database
+    target_info = None
+    if analyzer and hasattr(analyzer, 'func_by_qname'):
+        # First try exact match
+        if target_func_name and target_func_name in analyzer.func_by_qname:
+            target_info = analyzer.func_by_qname[target_func_name]
+        else:
+            # Try to find by short name match in the correct file
+            target_file = func_info.get('file_path', '')
+            target_short_name = func_info.get('function_name', '').split('.')[-1]
+            
+            # Debug: Try to find any function in the target file
+            for qname, finfo in analyzer.func_by_qname.items():
+                if (finfo.file_path == target_file and 
+                    finfo.name == target_short_name):
+                    target_info = finfo
+                    target_func_name = qname
+                    break
+            
+            # If still not found, try a more flexible search
+            if not target_info:
+                for qname, finfo in analyzer.func_by_qname.items():
+                    if (target_file in finfo.file_path and 
+                        target_short_name in finfo.name):
+                        target_info = finfo
+                        target_func_name = qname
+                        break
+    
+    if target_info:
+        output.append(f"\nFunction: {target_info.name}")
+        output.append(f"File: {target_info.file_path}")
+        output.append(f"Line: {target_info.line_number}")
+        if hasattr(target_info, 'signature') and target_info.signature:
+            output.append(f"Signature: {target_info.signature}")
+        output.append("\nSource Code:")
+        output.append("-" * 60)
+        for line_num, line in enumerate(target_info.source_code.splitlines(), target_info.line_number):
+            output.append(f"{line_num:4d}: {line}")
+        output.append("-" * 60)
+    else:
+        output.append(f"\nFunction: {target_func_name or func_info.get('function_name', 'Unknown')}")
+        output.append(f"File: {func_info.get('file_path', 'Unknown')}")
+        output.append(f"Line: {func_info.get('line_number', 'Unknown')}")
+        
+        # Fallback: Try to read the source code directly from the file
+        if analyzer and hasattr(analyzer, 'root_dir'):
+            try:
+                target_file = func_info.get('file_path', '')
+                target_line = func_info.get('line_number', 0)
+                if target_file and target_line:
+                    full_path = analyzer.root_dir / target_file
+                    if full_path.exists():
+                        with open(full_path, 'r', encoding='utf-8') as f:
+                            lines = f.readlines()
+                        
+                        # Find the function definition
+                        start_line = target_line - 1  # Convert to 0-based
+                        if start_line < len(lines):
+                            output.append("\nSource Code (direct file read):")
+                            output.append("-" * 60)
+                            
+                            # Read the function definition and body
+                            current_line = start_line
+                            indent_level = None
+                            
+                            while current_line < len(lines):
+                                line = lines[current_line]
+                                stripped = line.lstrip()
+                                
+                                # Determine initial indent for the function
+                                if current_line == start_line and stripped.startswith('def '):
+                                    indent_level = len(line) - len(stripped)
+                                
+                                # Stop when we reach a line at the same or less indentation (end of function)
+                                if (current_line > start_line and indent_level is not None and 
+                                    stripped and len(line) - len(stripped) <= indent_level and 
+                                    not line.strip().startswith(('"""', "'''", '#'))):
+                                    break
+                                
+                                output.append(f"{current_line + 1:4d}: {line.rstrip()}")
+                                current_line += 1
+                                
+                                # Safety limit
+                                if current_line - start_line > 50:
+                                    output.append("    ... (truncated)")
+                                    break
+                            
+                            output.append("-" * 60)
+                        else:
+                            output.append("(Line number out of range)")
+                    else:
+                        output.append("(Source file not found)")
+                else:
+                    output.append("(Missing file path or line number)")
+            except Exception as e:
+                output.append(f"(Error reading source code: {e})")
+        else:
+            output.append("(No analyzer root directory available)")
+    
+    output.append("")
+    
     # Dependencies - organize by levels if available
     dependencies_by_level = deps.get('dependencies_by_level', {})
     user_defined_deps = deps.get('user_defined_order', [])

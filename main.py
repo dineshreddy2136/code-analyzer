@@ -45,7 +45,44 @@ except ImportError:
     WHEEL_SUPPORT = False
 
 # Module-level constants
-STDLIB_MODULES = {
+
+def _get_stdlib_modules():
+    """Dynamically get standard library modules for better Python version compatibility"""
+    import sys
+    import pkgutil
+    import os
+    
+    modules = set()
+    
+    # For Python 3.10+, use the built-in sys.stdlib_module_names
+    if hasattr(sys, 'stdlib_module_names'):
+        modules.update(sys.stdlib_module_names)
+    else:
+        # Fallback for older Python versions
+        try:
+            # Path to the standard library
+            stdlib_path = os.path.dirname(os.__file__)
+            for _, name, _ in pkgutil.walk_packages([stdlib_path]):
+                modules.add(name.split('.')[0])  # Get top-level module name
+        except Exception:
+            # Ultimate fallback with common stdlib modules
+            modules.update([
+                'os', 'sys', 'json', 'datetime', 'time', 'math', 'random', 'secrets',
+                'hashlib', 'uuid', 'base64', 'urllib', 're', 'collections', 'itertools',
+                'functools', 'operator', 'pathlib', 'logging', 'threading', 'asyncio',
+                'socket', 'http', 'email', 'xml', 'sqlite3', 'csv', 'configparser'
+            ])
+    
+    # Add built-in modules
+    modules.update(sys.builtin_module_names)
+    
+    return modules
+
+# Dynamic standard library detection
+STDLIB_MODULES = _get_stdlib_modules()
+
+# Common functions for known standard library modules (for external dependency info)
+STDLIB_FUNCTIONS = {
     'secrets': ['randbelow', 'randbytes', 'token_bytes', 'token_hex', 'choice'],
     'random': ['randint', 'choice', 'shuffle', 'random', 'uniform', 'randrange'],
     'os': ['path', 'environ', 'getcwd', 'listdir', 'mkdir', 'remove', 'rename'],
@@ -733,8 +770,7 @@ class PythonDependencyAnalyzer:
             func = parts[-1]
             
             # Generate basic info for stdlib modules
-            stdlib_modules = list(STDLIB_MODULES.keys())
-            if module in stdlib_modules:
+            if module in STDLIB_MODULES:
                 return {
                     'signature': f'{func}(...)',
                     'source': f'# {qname} - Standard library function\n# Source not available in static analysis',
@@ -842,12 +878,13 @@ class PythonDependencyAnalyzer:
         imports = finfo.imports
         aliases = self.module_aliases.get(caller_mod, {})
         
-        # Common stdlib patterns
-        stdlib_modules = STDLIB_MODULES
+        # Use dynamic stdlib modules and function mappings for better compatibility
+        stdlib_modules = STDLIB_MODULES  # Now dynamically generated
+        stdlib_functions = STDLIB_FUNCTIONS
         
         # 1. Check if short name belongs to known stdlib modules
-        for module, functions in stdlib_modules.items():
-            if short in functions:
+        for module, functions in stdlib_functions.items():
+            if short in functions and module in stdlib_modules:
                 # Check if this module is imported
                 module_patterns = [module, f'{module}.*']
                 for imp in imports:
@@ -924,14 +961,33 @@ class PythonDependencyAnalyzer:
             for prefix in self.project_prefixes:
                 abs_target = f"{prefix}.{target}.__init__"
                 if abs_target in self.func_by_qname and self._is_internal(abs_target):
-                    init_targets.append(abs_target)
+                    # Additional validation: ensure this looks like a constructor
+                    if self._is_likely_constructor(self.func_by_qname[abs_target]):
+                        init_targets.append(abs_target)
         else:
             # Absolute target
             init_target = f"{target}.__init__"
             if init_target in self.func_by_qname and self._is_internal(init_target):
-                init_targets.append(init_target)
+                # Additional validation: ensure this looks like a constructor
+                if self._is_likely_constructor(self.func_by_qname[init_target]):
+                    init_targets.append(init_target)
                 
         return init_targets
+    
+    def _is_likely_constructor(self, func_info: FunctionInfo) -> bool:
+        """Check if a function is likely a constructor (__init__ method)"""
+        # Basic checks for constructor patterns
+        if not func_info.name.endswith('.__init__'):
+            return False
+            
+        # Check if first parameter is likely 'self'
+        if func_info.signature and '(' in func_info.signature:
+            params = func_info.signature.split('(')[1].split(')')[0].strip()
+            if params and not params.startswith('self'):
+                # Could be a static or class method mistakenly named __init__
+                return False
+                
+        return True
         
     def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> List[str]:
         """Sort functions in dependency order using resolved edges"""
@@ -960,7 +1016,12 @@ class PythonDependencyAnalyzer:
 
 
 class _CallFinder(ast.NodeVisitor):
-    """Find function calls within a function"""
+    """Find function calls within a function
+    
+    Note: This visitor handles most common call patterns, but complex chained calls
+    like get_db_connection().execute() cannot be fully resolved without type inference.
+    In such cases, we capture what we can (e.g., 'execute') for best-effort analysis.
+    """
     
     def __init__(self):
         self.calls = set()

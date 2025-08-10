@@ -401,7 +401,8 @@ class PythonDependencyAnalyzer:
             if file_stats.st_size > max_file_size:
                 logging.warning(f"Skipping large file {relative_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
                 if hasattr(self, '_analysis_stats'):
-                    self._analysis_stats['skipped_files'] += 1
+                    with self._lock:
+                        self._analysis_stats['skipped_files'] += 1
                 return []
                 
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -417,7 +418,8 @@ class PythonDependencyAnalyzer:
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
             logging.warning(f"Could not parse {file_path}: {e}")
             if hasattr(self, '_analysis_stats'):
-                self._analysis_stats['skipped_files'] += 1
+                with self._lock:
+                    self._analysis_stats['skipped_files'] += 1
             return []
             
     def analyze_codebase(self) -> None:
@@ -1951,8 +1953,13 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                 output.append(f"  {i}. {dep_name}")
             output.append("")
     else:
-        # Fallback to flat organization
-        all_deps = user_defined_deps + external_deps
+        # Fallback to flat organization (user_defined_order already includes externals)
+        seen = set()
+        all_deps = []
+        for name in (user_defined_deps + external_deps):
+            if name not in seen:
+                seen.add(name)
+                all_deps.append(name)
         output.append(f"Dependencies ({len(all_deps)} total):")
         output.append("-" * 30)
         
@@ -2045,8 +2052,13 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                     else:
                         output.append("(External dependency - source not available)")
     else:
-        # Fallback to flat format
-        all_deps = user_defined_deps + external_deps
+        # Fallback to flat format (avoid double-counting externals)
+        seen = set()
+        all_deps = []
+        for name in (user_defined_deps + external_deps):
+            if name not in seen:
+                seen.add(name)
+                all_deps.append(name)
         if all_deps:
             for i, dep_name in enumerate(all_deps, 1):
                 output.append(f"\n{i}. {dep_name}")

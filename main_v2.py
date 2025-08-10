@@ -60,7 +60,7 @@ class FunctionInfo:
     file_path: str
     line_number: int
     source_code: str
-    dependencies: Set[Tuple[str, str, Optional[str]]] = field(default_factory=set)  # (shortname, scope_tag, owner)
+    dependencies: Set[Tuple[str, str]] = field(default_factory=set)  # (shortname, scope_tag)
     calls: Set[str] = field(default_factory=set)
     imports: Set[str] = field(default_factory=set)
     signature: str = ""
@@ -308,11 +308,9 @@ class PythonDependencyAnalyzer:
             for f in files:
                 if f.endswith('.py'):
                     rel_dir = Path(root).relative_to(self.root_dir)
-                    if rel_dir.parts:  # Only process files in subdirectories
-                        top = rel_dir.parts[0]
-                        # Accept any directory containing Python files, but prefer packages with __init__.py
-                        if top not in SKIP_TOPS and not _is_meta_dir(top):
-                            prefixes.add(top)
+                    top = rel_dir.parts[0] if rel_dir.parts else Path(f).stem
+                    if top and top not in SKIP_TOPS and not _is_meta_dir(top):
+                        prefixes.add(top)
         self.project_prefixes = prefixes
         print(f"Project prefixes (internal): {sorted(self.project_prefixes)}")
         
@@ -429,7 +427,7 @@ class PythonDependencyAnalyzer:
             if organize_by_levels and level > 0:
                 dependencies_by_level.setdefault(level, set()).add(cur)
 
-            for dep in finfo.dependencies:  # (short, scope, owner)
+            for dep in finfo.dependencies:  # (short, scope)
                 short = dep[0]
                 all_raw_shortnames.add(short)
 
@@ -546,9 +544,9 @@ class PythonDependencyAnalyzer:
         }
         return external_functions.get(qname)
         
-    def _resolve_dependency(self, caller_qname: str, dep: Tuple[str, str, Optional[str]]) -> Optional[str]:
-        """Resolves a dependency triple to a qualified function name in the codebase."""
-        short, scope, owner = dep
+    def _resolve_dependency(self, caller_qname: str, dep: Tuple[str, str]) -> Optional[str]:
+        """Resolves a dependency tuple to a qualified function name in the codebase."""
+        short, scope = dep
         caller_mod = self.module_of.get(caller_qname, '')
         caller_cls = self.class_of.get(caller_qname)
 
@@ -563,41 +561,23 @@ class PythonDependencyAnalyzer:
         if cand in self.func_by_qname:
             return cand
             
-        # 3) Check for import aliases in UNSCOPED and OBJ calls
-        if scope in ('UNSCOPED', 'OBJ'):
+        # 3) Check for import aliases in UNSCOPED calls
+        if scope == 'UNSCOPED':
             aliases = self.module_aliases.get(caller_mod, {})
-            # direct function import alias: from pkg.m import foo as bar -> bar()
-            if scope == 'UNSCOPED' and short in aliases:
+            if short in aliases:
                 target = aliases[short]
-                # If target is relative, make it absolute by prepending the project prefix
-                if not target.startswith(tuple(self.project_prefixes)):
-                    # Try to make it absolute by finding which project prefix works
-                    for prefix in self.project_prefixes:
-                        abs_target = f"{prefix}.{target}"
-                        if abs_target in self.func_by_qname and self._is_internal(abs_target):
-                            return abs_target
-                else:
-                    # Target is already absolute
-                    if target in self.func_by_qname and self._is_internal(target):
-                        return target
-            # module alias receiver: import pkg.m as u; u.foo()
-            if scope == 'OBJ' and owner in aliases:
-                target_mod = aliases[owner]         # 'pkg.m'
-                # If target_mod is relative, make it absolute
-                if not target_mod.startswith(tuple(self.project_prefixes)):
-                    for prefix in self.project_prefixes:
-                        abs_target_mod = f"{prefix}.{target_mod}"
-                        cand = f"{abs_target_mod}.{short}"
-                        if cand in self.func_by_qname and self._is_internal(cand):
-                            return cand
-                else:
-                    # target_mod is already absolute
-                    cand = f"{target_mod}.{short}"
+                # If it's a fully-qualified function import:
+                if target in self.func_by_qname and self._is_internal(target):
+                    return target
+                # If it's a module alias and we can form "module.short"
+                if '.' in target:  # module reference
+                    cand = f"{target}.{short}"
                     if cand in self.func_by_qname and self._is_internal(cand):
                         return cand
                         
         # 4) Check for same-class static/classmethod calls (Class.method from within Class)
-        if scope == 'OBJ' and owner and caller_cls and owner == caller_cls:
+        if scope == 'AMBIGUOUS_OBJ' and caller_cls:
+            # The original call might be "ClassName.method" which we normalized to just "method"
             cand = f"{caller_mod}.{caller_cls}.{short}"
             if cand in self.func_by_qname:
                 return cand
@@ -606,24 +586,6 @@ class PythonDependencyAnalyzer:
         bucket = self.short_index.get(short, set())
         if len(bucket) == 1:
             return next(iter(bucket))
-
-        # 6) Try constructor for class instantiation (e.g., UserService() -> UserService.__init__)
-        if scope == 'UNSCOPED' and short in aliases:
-            target = aliases[short]
-            # Try with __init__
-            init_targets = []
-            if not target.startswith(tuple(self.project_prefixes)):
-                for prefix in self.project_prefixes:
-                    abs_target = f"{prefix}.{target}.__init__"
-                    if abs_target in self.func_by_qname and self._is_internal(abs_target):
-                        init_targets.append(abs_target)
-            else:
-                init_target = f"{target}.__init__"
-                if init_target in self.func_by_qname and self._is_internal(init_target):
-                    init_targets.append(init_target)
-            
-            if len(init_targets) == 1:
-                return init_targets[0]
 
         return None   # ambiguous → drop
         
@@ -773,16 +735,15 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         call_finder = _CallFinder()
         call_finder.visit(node)
 
-        # Normalize to (shortname, scope_tag, owner)
-        normalized: Set[Tuple[str, str, Optional[str]]] = set()
+        # Normalize to (shortname, scope_tag)
+        normalized: Set[Tuple[str, str]] = set()
         for c in call_finder.calls:
             if c.startswith('self.') or c.startswith('cls.'):
-                normalized.add((c.split('.', 1)[1], 'CLASS_LOCAL', None))
+                normalized.add((c.split('.', 1)[1], 'CLASS_LOCAL'))
             elif '.' in c:
-                owner, meth = c.split('.', 1)
-                normalized.add((meth, 'OBJ', owner))  # keep owner!
+                normalized.add((c.split('.')[-1], 'AMBIGUOUS_OBJ'))
             else:
-                normalized.add((c, 'UNSCOPED', None))
+                normalized.add((c, 'UNSCOPED'))
 
         # Drop dunders like __len__, __repr__ and noisy attributes
         noisy = {'__call__'}
@@ -793,7 +754,7 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
             file_path=self.file_path,
             line_number=start_line,
             source_code=source_code,
-            dependencies=set(normalized),                # triples now
+            dependencies=set(normalized),                # tuples now
             calls=set(x[0] for x in normalized),         # shortnames, for display only
             imports=self.imports.copy(),
             signature=signature,
@@ -866,7 +827,6 @@ class CodebaseDependencyAnalyzer:
         
     def run(self) -> Dict[str, Any]:
         """Run the complete analysis"""
-        keep = bool(os.environ.get("CDA_KEEP_EXTRACTED"))
         try:
             # Step 1: Extract codebase
             print(f"Extracting codebase from {self.codebase_path}...")
@@ -898,7 +858,7 @@ class CodebaseDependencyAnalyzer:
                 'dependencies': dependency_result,
                 'analyzer': dependency_result.get('analyzer'),  # Pass the analyzer from dependency result
                 'codebase_path': self.codebase_path,
-                'extracted_to': self.extracted_dir if keep else None
+                'extracted_to': self.extracted_dir
             }
             
         except Exception as e:
@@ -908,8 +868,7 @@ class CodebaseDependencyAnalyzer:
             }
         finally:
             # Clean up
-            if not keep:
-                self.extractor.cleanup()
+            self.extractor.cleanup()
             
     def _detect_codebase_language(self) -> str:
         """Detect the primary language of the codebase - focuses on Python"""
@@ -1128,25 +1087,23 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     if 'error' in result:
         return f"Error: {result['error']}"
         
-    # Check for dependency-level errors first
-    deps = result.get('dependencies', {})
-    if deps.get('error'):
-        return f"Error: {deps['error']}"
-        
     # Check for ambiguous function
-    if deps.get('ambiguous_function'):
-        output = ["Codebase Dependency Analysis Results", "=" * 40, ""]
+    if result.get('ambiguous_function'):
+        output = ["Codebase Dependency Analysis Results"]
+        output.append("=" * 40)
+        output.append("")
         output.append("⚠️  Function name is ambiguous!")
-        cands = deps.get('candidates', [])
-        if cands:
+        candidates = result.get('candidates', [])
+        if candidates:
             output.append("Available candidates:")
-            for i, cand in enumerate(cands, 1):
+            for i, cand in enumerate(candidates, 1):
                 output.append(f"  {i}. {cand}")
             output.append("")
-            output.append("Please specify the fully qualified name (e.g., pkg.module.Class.method)")
+            output.append("Please specify the full qualified name (e.g., 'pkg.module.Class.method')")
         else:
             output.append("No matching functions found in the codebase.")
         return "\n".join(output)
+        
     output = ["Codebase Dependency Analysis Results"]
     output.append("=" * 40)
     output.append("")
@@ -1160,6 +1117,7 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     output.append("")
     
     # Dependencies - organize by levels if available
+    deps = result['dependencies']
     dependencies_by_level = deps.get('dependencies_by_level', {})
     user_defined_deps = deps.get('user_defined_order', [])
     external_deps = deps.get('external_dependencies', [])

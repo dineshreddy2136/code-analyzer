@@ -60,7 +60,7 @@ class FunctionInfo:
     file_path: str
     line_number: int
     source_code: str
-    dependencies: Set[str] = field(default_factory=set)
+    dependencies: Set[Tuple[str, str]] = field(default_factory=set)  # (shortname, scope_tag)
     calls: Set[str] = field(default_factory=set)
     imports: Set[str] = field(default_factory=set)
     signature: str = ""
@@ -247,6 +247,11 @@ class PythonDependencyAnalyzer:
         self.imports: Dict[str, Set[str]] = defaultdict(set)
         self.max_functions_in_memory = max_functions_in_memory
         self._lock = threading.Lock()  # For thread safety
+        self.func_by_qname: Dict[str, FunctionInfo] = {}
+        self.short_index: Dict[str, Set[str]] = defaultdict(set)   # 'save' -> {'pkg.mod.Class.save', ...}
+        self.module_of: Dict[str, str] = {}                        # qname -> 'pkg.mod'
+        self.class_of: Dict[str, Optional[str]] = {}               # qname -> class or None
+        self.project_prefixes: Set[str] = set()                    # internal top-level packages
         
     def analyze_file(self, file_path: str) -> List[FunctionInfo]:
         """Analyze a Python file and extract function information"""
@@ -290,6 +295,23 @@ class PythonDependencyAnalyzer:
         else:
             self._analyze_files_sequential(python_files)
             
+        # Mark internal packages (so stdlib/Django don't leak in)
+        prefixes = set()
+        for root, _, files in os.walk(self.root_dir):
+            for f in files:
+                if f.endswith('.py'):
+                    rel_dir = Path(root).relative_to(self.root_dir)
+                    top = rel_dir.parts[0] if rel_dir.parts else Path(f).stem
+                    if top and top not in ('__pycache__',):
+                        prefixes.add(top)
+        self.project_prefixes = prefixes
+        print(f"Project prefixes (internal): {sorted(self.project_prefixes)}")
+        
+    def _is_internal(self, qname: str) -> bool:
+        """Check if a qualified name is internal to the project"""
+        top = qname.split('.', 1)[0]
+        return top in self.project_prefixes
+            
     def _analyze_files_sequential(self, python_files: List[str]) -> None:
         """Analyze files sequentially (for small codebases)"""
         for file_path in python_files:
@@ -332,118 +354,111 @@ class PythonDependencyAnalyzer:
         """Store function information thread-safely with memory management"""
         with self._lock:
             for func in functions:
-                # Memory management: warn if we're storing too many functions
                 if len(self.functions) >= self.max_functions_in_memory:
-                    print(f"Warning: Large codebase detected. {len(self.functions)} functions in memory. "
-                          f"Consider analyzing smaller chunks or increasing memory limits.")
-                
-                self.functions[func.name] = func
-                # Track classes
-                if '.' in func.name:
-                    class_name = func.name.split('.')[0]
-                    if class_name not in self.classes:
-                        self.classes[class_name] = {}
-                    method_name = func.name.split('.')[1]
-                    self.classes[class_name][method_name] = func
+                    print(f"Warning: Large codebase detected. {len(self.functions)} functions in memory.")
+                q = func.name                      # qualified
+                self.functions[q] = func           # keep legacy map working
+                self.func_by_qname[q] = func
+
+                parts = q.split('.')
+                if len(parts) >= 3:
+                    module = '.'.join(parts[:-2]); cls = parts[-2]
+                elif len(parts) >= 2:
+                    module = '.'.join(parts[:-1]); cls = None
+                else:
+                    module, cls = '', None
+
+                self.module_of[q] = module
+                self.class_of[q] = cls
+
+                short = func.signature.split('(')[0] if func.signature else parts[-1]
+                self.short_index[short].add(q)
                 
     def find_function_dependencies(self, function_name: str, organize_by_levels: bool = False) -> Dict[str, Any]:
         """Find all dependencies for a function in correct order, optionally organized by levels"""
-        if function_name not in self.functions:
-            print(f"Function '{function_name}' not found in analyzed functions")
-            print(f"Available functions: {list(self.functions.keys())}")
-            return {
-                'user_defined_order': [],
-                'all_dependencies': set(),
-                'total_calls': 0,
-                'dependencies_by_level': {} if organize_by_levels else None
-            }
-            
-        all_raw_dependencies = set()
+        # accept qualified or short; map short→unique if possible
+        start = function_name
+        if start not in self.func_by_qname:
+            bucket = self.short_index.get(function_name, set())
+            if len(bucket) == 1:
+                start = next(iter(bucket))
+            else:
+                if bucket:
+                    sample = ', '.join(list(sorted(bucket))[:5])
+                    print(f"Function '{function_name}' ambiguous. Candidates: {sample}...")
+                else:
+                    print(f"Function '{function_name}' not found.")
+                return {
+                    'user_defined_order': [],
+                    'all_dependencies': set(),
+                    'total_calls': 0,
+                    'external_dependencies': [],
+                    'dependencies_by_level': {} if organize_by_levels else None
+                }
+
+        resolved_edges: Dict[str, Set[str]] = defaultdict(set)
+        visited = {start}
+        queue = [(start, 0)]
+        all_raw_shortnames = set()
         external_dependencies = set()
         dependencies_by_level = {} if organize_by_levels else None
-        
-        # Use a queue for breadth-first search with level tracking
-        queue = [(function_name, 0)]  # (function_name, level)
-        visited_resolved = {function_name}
-        level_map = {function_name: 0}
 
         while queue:
-            current_func, current_level = queue.pop(0)
-            
-            if current_func not in self.functions:
+            cur, level = queue.pop(0)
+            finfo = self.func_by_qname.get(cur)
+            if not finfo:
                 continue
-                
-            func_info = self.functions[current_func]
-            print(f"Analyzing dependencies for {current_func}: {func_info.dependencies}")
-            
-            # Initialize level in dependencies_by_level if organizing by levels
-            if organize_by_levels and current_level > 0:
-                if current_level not in dependencies_by_level:
-                    dependencies_by_level[current_level] = set()
-                dependencies_by_level[current_level].add(current_func)
-            
-            for dep in func_info.dependencies:
-                all_raw_dependencies.add(dep)
-                
-                # Check for external dependencies (like secrets.randbelow)
-                if dep.startswith('secrets.') or dep in ['randbelow', 'randbytes', 'getrandbits']:
-                    external_dep_name = dep if dep.startswith('secrets.') else f'secrets.{dep}'
-                    external_dependencies.add(external_dep_name)
-                    
-                    # Add to level organization if requested
-                    if organize_by_levels:
-                        next_level = current_level + 1
-                        if next_level not in dependencies_by_level:
-                            dependencies_by_level[next_level] = set()
-                        dependencies_by_level[next_level].add(external_dep_name)
-                    
-                    continue
-                
-                # Resolve internal dependency to a function in our list
-                resolved_dep = self._resolve_dependency(dep, current_func)
-                
-                if resolved_dep and resolved_dep not in visited_resolved:
-                    visited_resolved.add(resolved_dep)
-                    next_level = current_level + 1
-                    level_map[resolved_dep] = next_level
-                    queue.append((resolved_dep, next_level))
 
-        # Topological sort to get correct order of user-defined functions
-        internal_funcs = [f for f in visited_resolved if f != function_name]
-        ordered_user_deps = self._topological_sort(internal_funcs)
-        
-        # Add external dependencies to the final order
-        final_order = ordered_user_deps + sorted(external_dependencies)
-        
-        result = {
+            if organize_by_levels and level > 0:
+                dependencies_by_level.setdefault(level, set()).add(cur)
+
+            for dep in finfo.dependencies:  # (short, scope)
+                short = dep[0]
+                all_raw_shortnames.add(short)
+
+                # keep your stdlib external examples if you want
+                if short in {'randbelow', 'randbytes', 'getrandbits'}:
+                    external_dependencies.add(f"secrets.{short}")
+                    if organize_by_levels:
+                        dependencies_by_level.setdefault(level+1, set()).add(f"secrets.{short}")
+                    continue
+
+                tgt = self._resolve_dependency(cur, dep)
+                if tgt and self._is_internal(tgt):
+                    resolved_edges[cur].add(tgt)
+                    if tgt not in visited:
+                        visited.add(tgt)
+                        queue.append((tgt, level+1))
+
+        ordered = self._topological_sort_resolved(visited, resolved_edges)
+        if ordered and ordered[0] == start:
+            ordered = ordered[1:]
+
+        final_order = ordered + sorted(external_dependencies)
+        out = {
             'user_defined_order': final_order,
-            'all_dependencies': all_raw_dependencies,
-            'total_calls': len(all_raw_dependencies),
+            'all_dependencies': all_raw_shortnames,
+            'total_calls': len(all_raw_shortnames),
             'external_dependencies': sorted(external_dependencies)
         }
-        
-        # Add level organization if requested
         if organize_by_levels:
-            result['dependencies_by_level'] = dependencies_by_level
-        
-        print(f"Final dependency order: {final_order}")
-        print(f"Final dependency order: {final_order}")
-        print(f"All dependencies detected: {sorted(all_raw_dependencies)}")
-        print(f"External dependencies: {sorted(external_dependencies)}")
-        if organize_by_levels:
-            print(f"Dependencies by level: {dependencies_by_level}")
-        
-        return result
+            out['dependencies_by_level'] = dependencies_by_level
+        return out
 
     def _get_nested_dependency_levels(self, function_name: str, global_dependencies_by_level: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
         """Get the nested dependency levels for a specific function"""
-        if function_name not in self.functions:
+        if function_name not in self.func_by_qname:
             return {}
         
         # Get direct dependencies of this specific function
-        direct_deps = set(self.functions[function_name].dependencies)
-        user_defined_direct_deps = {self._resolve_dependency(dep, function_name) for dep in direct_deps if self._resolve_dependency(dep, function_name)}
-        user_defined_direct_deps = {dep for dep in user_defined_direct_deps if dep and dep != function_name}
+        direct_deps = self.func_by_qname[function_name].dependencies
+        resolved_once = []
+        for d in direct_deps:
+            r = self._resolve_dependency(function_name, d)
+            if r:
+                resolved_once.append(r)
+
+        user_defined_direct_deps = {r for r in resolved_once if r != function_name}
         
         if not user_defined_direct_deps:
             return {}
@@ -463,12 +478,16 @@ class PythonDependencyAnalyzer:
             
             # For each dependency at current level, find its dependencies
             for dep in current_level_deps:
-                if dep in self.functions and dep not in visited_deps:
+                if dep in self.func_by_qname and dep not in visited_deps:
                     visited_deps.add(dep)
-                    dep_dependencies = set(self.functions[dep].dependencies)
-                    resolved_deps = {self._resolve_dependency(d, dep) for d in dep_dependencies if self._resolve_dependency(d, dep)}
+                    dep_dependencies = self.func_by_qname[dep].dependencies
+                    resolved_deps = set()
+                    for d in dep_dependencies:
+                        r = self._resolve_dependency(dep, d)
+                        if r:
+                            resolved_deps.add(r)
                     # Only include user-defined functions that haven't been visited
-                    resolved_deps = {d for d in resolved_deps if d and d not in visited_deps and d in self.functions}
+                    resolved_deps = {d for d in resolved_deps if d not in visited_deps and d in self.func_by_qname}
                     next_level_deps.update(resolved_deps)
             
             if next_level_deps:
@@ -508,77 +527,50 @@ class PythonDependencyAnalyzer:
         }
         return external_functions.get(qname)
         
-    def _resolve_dependency(self, dep_name: str, current_function_context: Optional[str] = None) -> Optional[str]:
-        """Resolves a raw dependency string to a function name in the codebase."""
-        # 1. Direct match
-        if dep_name in self.functions:
-            return dep_name
-        
-        # 2. Constructor call (e.g., "ClassName" -> "ClassName.__init__")
-        init_name = f"{dep_name}.__init__"
-        if init_name in self.functions:
-            return init_name
+    def _resolve_dependency(self, caller_qname: str, dep: Tuple[str, str]) -> Optional[str]:
+        """Resolves a dependency tuple to a qualified function name in the codebase."""
+        short, scope = dep
+        caller_mod = self.module_of.get(caller_qname, '')
+        caller_cls = self.class_of.get(caller_qname)
 
-        # 3. Heuristic for obj.method or Class.method
-        if '.' in dep_name:
-            method_name = dep_name.split('.')[-1]
-            obj_name = dep_name.split('.')[0]
-            
-            # Collect all possible matches
-            possible_matches = []
-            for func_name in self.functions:
-                if func_name.endswith(f".{method_name}"):
-                    possible_matches.append(func_name)
-            
-            if not possible_matches:
-                return None
-                
-            # If we have multiple matches, try to be smarter about resolution
-            if len(possible_matches) == 1:
-                return possible_matches[0]
-            
-            # For 'self.method', prefer methods from the same class if we can determine context
-            if obj_name == 'self' and current_function_context:
-                # Extract class name from current function context (e.g., "ClassName.method" -> "ClassName")
-                if '.' in current_function_context:
-                    current_class = current_function_context.split('.')[0]
-                    class_method = f"{current_class}.{method_name}"
-                    if class_method in possible_matches:
-                        return class_method
-            
-            # Return the first match as fallback
-            return possible_matches[0]
+        # 1) same class (for self./cls.)
+        if scope == 'CLASS_LOCAL' and caller_cls:
+            cand = f"{caller_mod}.{caller_cls}.{short}"
+            if cand in self.func_by_qname:
+                return cand
 
-        return None
+        # 2) same module top-level
+        cand = f"{caller_mod}.{short}"
+        if cand in self.func_by_qname:
+            return cand
+
+        # 3) unique across project
+        bucket = self.short_index.get(short, set())
+        if len(bucket) == 1:
+            return next(iter(bucket))
+
+        return None   # ambiguous → drop
         
-    def _topological_sort(self, func_names: List[str]) -> List[str]:
-        """Sort functions in dependency order"""
-        in_degree = {name: 0 for name in func_names}
-        graph = {name: [] for name in func_names}
-        
-        # Build dependency graph
-        for func_name in func_names:
-            if func_name in self.functions:
-                func_info = self.functions[func_name]
-                for dep in func_info.dependencies:
-                    if dep in func_names:
-                        graph[dep].append(func_name)
-                        in_degree[func_name] += 1
-                        
-        # Kahn's algorithm
-        queue = deque([name for name in func_names if in_degree[name] == 0])
-        result = []
-        
-        while queue:
-            current = queue.popleft()
-            result.append(current)
-            
-            for neighbor in graph[current]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-                    
-        return result
+    def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> List[str]:
+        """Sort functions in dependency order using resolved edges"""
+        in_deg = {n: 0 for n in nodes}
+        for u in nodes:
+            for v in edges.get(u, ()):
+                if v in in_deg:
+                    in_deg[v] += 1
+        q = deque([n for n, d in in_deg.items() if d == 0])
+        out = []
+        while q:
+            u = q.popleft()
+            out.append(u)
+            for v in edges.get(u, ()):
+                in_deg[v] -= 1
+                if in_deg[v] == 0:
+                    q.append(v)
+        if len(out) < len(nodes):
+            cyc = [n for n, d in in_deg.items() if d > 0]
+            print(f"Warning: cycle(s) detected among: {cyc}")
+        return out
 
 
 class _CallFinder(ast.NodeVisitor):
@@ -617,16 +609,6 @@ class _CallFinder(ast.NodeVisitor):
                 method_name = node.func.attr
                 if method_name not in {'add', 'append', 'remove', 'pop', 'get', 'set', 'clear'}:
                     self.calls.add(method_name)
-                
-        self.generic_visit(node)
-        
-    def visit_Name(self, node):
-        # Also detect variable/constant references that are loaded (not stored)
-        if isinstance(node.ctx, ast.Load):
-            # Only add names that look like constants (all caps) or known function names
-            name = node.id
-            if name.isupper() or name in {'callable', 'isinstance', 'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple'}:
-                self.calls.add(name)
                 
         self.generic_visit(node)
 
@@ -672,49 +654,49 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
     def _extract_function_info(self, node) -> FunctionInfo:
         """Extract function information from AST node"""
         func_name = node.name
-        full_func_name = func_name
+        # qualify by module path from file path
+        mod = str(Path(self.file_path).with_suffix('')).replace(os.sep, '.')
         if self.current_class:
-            full_func_name = f"{self.current_class}.{func_name}"
-            
-        # Get function source code
+            full_func_name = f"{mod}.{self.current_class}.{func_name}"
+        else:
+            full_func_name = f"{mod}.{func_name}"
+
         start_line = node.lineno
         end_line = node.end_lineno or start_line
         source_lines = self.source_lines[start_line-1:end_line]
         source_code = '\n'.join(source_lines)
-        
-        # Get function signature
+
         signature = self._get_function_signature(node)
-        
-        # Get docstring
         docstring = ast.get_docstring(node) or ""
-        
-        # Find function calls and dependencies
+
         call_finder = _CallFinder()
         call_finder.visit(node)
-        
-        # Also add method calls without self prefix if in a class
-        if self.current_class:
-            # Look for self.method_name calls and add as method calls
-            for call in list(call_finder.calls):
-                if call.startswith('self.'):
-                    method_name = call[5:]  # Remove 'self.'
-                    call_finder.calls.add(f"{self.current_class}.{method_name}")
-        
-        func_info = FunctionInfo(
+
+        # Normalize to (shortname, scope_tag)
+        normalized: Set[Tuple[str, str]] = set()
+        for c in call_finder.calls:
+            if c.startswith('self.') or c.startswith('cls.'):
+                normalized.add((c.split('.', 1)[1], 'CLASS_LOCAL'))
+            elif '.' in c:
+                normalized.add((c.split('.')[-1], 'AMBIGUOUS_OBJ'))
+            else:
+                normalized.add((c, 'UNSCOPED'))
+
+        # Drop dunders like __len__, __repr__ and noisy attributes
+        noisy = {'__call__'}
+        normalized = {d for d in normalized if d[0] not in noisy and not (d[0].startswith('__') and d[0].endswith('__'))}
+
+        return FunctionInfo(
             name=full_func_name,
             file_path=self.file_path,
             line_number=start_line,
             source_code=source_code,
-            dependencies=call_finder.calls,
-            calls=call_finder.calls,
+            dependencies=set(normalized),                # tuples now
+            calls=set(x[0] for x in normalized),         # shortnames, for display only
             imports=self.imports.copy(),
             signature=signature,
             docstring=docstring
         )
-        
-        print(f"Extracted function: {full_func_name} with dependencies: {call_finder.calls}")
-        
-        return func_info
         
     def _get_function_signature(self, node) -> str:
         """Get function signature as string"""
@@ -945,17 +927,18 @@ class CodebaseDependencyAnalyzer:
         possible_names = [function_name]
         
         # If it looks like a method name, try to find it as part of classes
-        for class_name in analyzer.classes.keys():
-            possible_names.append(f"{class_name}.{function_name}")
+        for qname in analyzer.func_by_qname.keys():
+            if qname.endswith(f".{function_name}"):
+                possible_names.append(qname)
             
         found_function_name = None
         for name in possible_names:
-            if name in analyzer.functions:
+            if name in analyzer.func_by_qname:
                 found_function_name = name
                 break
                 
         if not found_function_name:
-            print(f"Available functions: {list(analyzer.functions.keys())}")
+            print(f"Available functions: {list(analyzer.func_by_qname.keys())}")
             return {
                 'dependency_order': [],
                 'detailed_dependencies': [],
@@ -1126,8 +1109,8 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                 output.append("=" * (len(dep_name) + 10))
                 
                 # Get function info from the analyzer
-                if dep_name in analyzer.functions:
-                    func_info = analyzer.functions[dep_name]
+                if dep_name in analyzer.func_by_qname:
+                    func_info = analyzer.func_by_qname[dep_name]
                     output.append(f"File: {func_info.file_path}")
                     output.append(f"Line: {func_info.line_number}")
                     output.append(f"Signature: {func_info.signature}")
@@ -1145,10 +1128,10 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                                     output.append(f"  Level-{nested_level}: {', '.join(sorted(nested_funcs))}")
                     
                     # Show direct dependencies for Level-2+ functions
-                    elif level > 1 and dep_name in analyzer.functions:
-                        func_deps = analyzer.functions[dep_name].dependencies
-                        resolved_deps = [analyzer._resolve_dependency(d, dep_name) for d in func_deps]
-                        resolved_deps = [d for d in resolved_deps if d and d in analyzer.functions]
+                    elif level > 1 and dep_name in analyzer.func_by_qname:
+                        func_deps = analyzer.func_by_qname[dep_name].dependencies
+                        resolved_deps = [analyzer._resolve_dependency(dep_name, d) for d in func_deps]
+                        resolved_deps = [d for d in resolved_deps if d and d in analyzer.func_by_qname]
                         if resolved_deps:
                             output.append(f"\nDirect Dependencies: {', '.join(sorted(resolved_deps))}")
                     
@@ -1185,8 +1168,8 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                 output.append("=" * (len(dep_name) + 10))
                 
                 # Get function info from the analyzer
-                if dep_name in analyzer.functions:
-                    func_info = analyzer.functions[dep_name]
+                if dep_name in analyzer.func_by_qname:
+                    func_info = analyzer.func_by_qname[dep_name]
                     output.append(f"File: {func_info.file_path}")
                     output.append(f"Line: {func_info.line_number}")
                     output.append(f"Signature: {func_info.signature}")

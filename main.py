@@ -1727,31 +1727,64 @@ class AnalysisRunner:
         return dependencies_result
 
 
-def emit_dot(edges: Dict[str, Set[str]], start: str, external_edges: Dict[str, Set[str]] = None) -> str:
-    """Emit dependencies as Graphviz DOT format"""
+def emit_dot(
+    edges: Dict[str, Set[str]],
+    start: str,
+    external_edges: Dict[str, Set[str]] = None,
+    cycle_nodes: Optional[List[str]] = None
+) -> str:
+    """Emit dependencies as Graphviz DOT format with rich styling"""
+    cycle_nodes = set(cycle_nodes or [])
     lines = ["digraph deps {"]
-    lines.append('  node [shape=box];')
     lines.append('  rankdir=LR;')
-    lines.append(f'  "{start}" [style=filled,fillcolor=lightblue];')
-    
-    # Collect all external nodes for styling
+    lines.append('  node [shape=box, fontsize=10];')
+    lines.append('  edge [arrowsize=0.7];')
+
+    # start node highlight
+    lines.append(f'  "{start}" [style=filled, fillcolor=lightblue];')
+
+    # external node styling (ellipse + dashed)
     external_nodes = set()
     if external_edges:
         for vs in external_edges.values():
             external_nodes.update(vs)
-    
-    # Style external nodes differently
     for node in sorted(external_nodes):
-        lines.append(f'  "{node}" [shape=ellipse,style=dashed];')
-    
+        # if cyclic AND external (unlikely), prioritize cycle styling
+        if node in cycle_nodes:
+            lines.append(f'  "{node}" [shape=doublecircle, color=red, penwidth=2];')
+        else:
+            lines.append(f'  "{node}" [shape=ellipse, style=dashed];')
+
+    # cycle nodes styling (internal)
+    for node in sorted(cycle_nodes - external_nodes):
+        lines.append(f'  "{node}" [shape=doublecircle, color=red, penwidth=2];')
+
+    # internal edges (solid)
     for u, vs in sorted(edges.items()):
         for v in sorted(vs):
-            lines.append(f'  "{u}" -> "{v}";')
-    
+            # color cycle edges red if either endpoint is in a cycle
+            extra = ' color=red, penwidth=1.6' if (u in cycle_nodes or v in cycle_nodes) else ''
+            lines.append(f'  "{u}" -> "{v}"{f"[{extra}]" if extra else ""};')
+
+    # external edges (dashed)
     if external_edges:
         for u, vs in sorted(external_edges.items()):
             for v in sorted(vs):
-                lines.append(f'  "{u}" -> "{v}" [style=dashed];')
+                # if a cyclic endpoint touches an external edge, keep dashed but tint red
+                extra = ', color=red, penwidth=1.6' if (u in cycle_nodes or v in cycle_nodes) else ''
+                lines.append(f'  "{u}" -> "{v}" [style=dashed{extra}];')
+
+    # tiny legend (optional)
+    lines += [
+        '  subgraph cluster_legend {',
+        '    label="Legend"; fontsize=10; style=dashed; color=gray;',
+        '    l_start [label="Start", shape=box, style=filled, fillcolor=lightblue];',
+        '    l_ext [label="External", shape=ellipse, style=dashed];',
+        '    l_cycle [label="Cycle Node", shape=doublecircle, color=red, penwidth=2];',
+        '    l_edge [label="Internal Edge", shape=point, width=0.1];',
+        '    l_extedge [label="External Edge (dashed)", shape=point, width=0.1];',
+        '  }'
+    ]
     
     lines.append("}")
     return "\n".join(lines)
@@ -1845,7 +1878,8 @@ Examples:
             start_node = deps.get('start_node', 'unknown')
             edges = deps.get('edges', {})
             external_edges = deps.get('external_edges', {})
-            output = emit_dot(edges, start_node, external_edges)
+            cycle_nodes = deps.get('cycle_nodes', [])
+            output = emit_dot(edges, start_node, external_edges, cycle_nodes)
     elif args.emit == 'text':
         output = _format_text_output(result)
     else:

@@ -346,29 +346,25 @@ class PythonDependencyAnalyzer:
                     method_name = func.name.split('.')[1]
                     self.classes[class_name][method_name] = func
                 
-    def find_function_dependencies(self, function_name: str, organize_by_levels: bool = False) -> Dict[str, Any]:
-        """Find all dependencies for a function in correct order, optionally organized by levels"""
+    def find_function_dependencies(self, function_name: str) -> Dict[str, Any]:
+        """Find all dependencies for a function in correct order"""
         if function_name not in self.functions:
             print(f"Function '{function_name}' not found in analyzed functions")
             print(f"Available functions: {list(self.functions.keys())}")
             return {
                 'user_defined_order': [],
                 'all_dependencies': set(),
-                'total_calls': 0,
-                'dependencies_by_level': {} if organize_by_levels else None
+                'total_calls': 0
             }
             
         all_raw_dependencies = set()
-        external_dependencies = set()
-        dependencies_by_level = {} if organize_by_levels else None
         
-        # Use a queue for breadth-first search with level tracking
-        queue = [(function_name, 0)]  # (function_name, level)
+        # Use a queue for breadth-first search
+        queue = [function_name]
         visited_resolved = {function_name}
-        level_map = {function_name: 0}
 
         while queue:
-            current_func, current_level = queue.pop(0)
+            current_func = queue.pop(0)
             
             if current_func not in self.functions:
                 continue
@@ -376,91 +372,36 @@ class PythonDependencyAnalyzer:
             func_info = self.functions[current_func]
             print(f"Analyzing dependencies for {current_func}: {func_info.dependencies}")
             
-            # Initialize level in dependencies_by_level if organizing by levels
-            if organize_by_levels and current_level > 0:
-                if current_level not in dependencies_by_level:
-                    dependencies_by_level[current_level] = set()
-                dependencies_by_level[current_level].add(current_func)
-            
             for dep in func_info.dependencies:
                 all_raw_dependencies.add(dep)
                 
-                # Check for external dependencies (like secrets.randbelow)
-                if dep.startswith('secrets.') or dep in ['randbelow', 'randbytes', 'getrandbits']:
-                    external_dep_name = dep if dep.startswith('secrets.') else f'secrets.{dep}'
-                    external_dependencies.add(external_dep_name)
-                    
-                    # Add to level organization if requested
-                    if organize_by_levels:
-                        next_level = current_level + 1
-                        if next_level not in dependencies_by_level:
-                            dependencies_by_level[next_level] = set()
-                        dependencies_by_level[next_level].add(external_dep_name)
-                    
-                    continue
-                
-                # Resolve internal dependency to a function in our list
+                # Resolve dependency to a function in our list
                 resolved_dep = self._resolve_dependency(dep)
                 
                 if resolved_dep and resolved_dep not in visited_resolved:
                     visited_resolved.add(resolved_dep)
-                    next_level = current_level + 1
-                    level_map[resolved_dep] = next_level
-                    queue.append((resolved_dep, next_level))
+                    queue.append(resolved_dep)
 
         # Topological sort to get correct order of user-defined functions
-        internal_funcs = [f for f in visited_resolved if f != function_name]
-        ordered_user_deps = self._topological_sort(internal_funcs)
+        ordered_user_deps = self._topological_sort(list(visited_resolved))
         
-        # Add external dependencies to the final order
-        final_order = ordered_user_deps + sorted(external_dependencies)
+        # Check for circular dependencies
+        if len(ordered_user_deps) < len(visited_resolved):
+            missing_funcs = set(visited_resolved) - set(ordered_user_deps)
+            print(f"Warning: Potential circular dependencies detected involving: {missing_funcs}")
+        
+        # The final list of dependencies to show should be the ordered user-defined ones
+        final_order = [f for f in ordered_user_deps]
         
         result = {
             'user_defined_order': final_order,
             'all_dependencies': all_raw_dependencies,
-            'total_calls': len(all_raw_dependencies),
-            'external_dependencies': sorted(external_dependencies)
+            'total_calls': len(all_raw_dependencies)
         }
         
-        # Add level organization if requested
-        if organize_by_levels:
-            result['dependencies_by_level'] = dependencies_by_level
-        
-        print(f"Final dependency order: {final_order}")
         print(f"Final dependency order: {final_order}")
         print(f"All dependencies detected: {sorted(all_raw_dependencies)}")
-        print(f"External dependencies: {sorted(external_dependencies)}")
-        if organize_by_levels:
-            print(f"Dependencies by level: {dependencies_by_level}")
-        
         return result
-
-    def _get_external_function_info(self, qname: str) -> Optional[Dict[str, Any]]:
-        """Get basic information about external/standard library functions"""
-        external_functions = {
-            'secrets.randbelow': {
-                'signature': 'randbelow(exclusive_upper_bound)',
-                'source': 'def randbelow(exclusive_upper_bound):\n    """Return a random int in the range [0, n)."""\n    if exclusive_upper_bound <= 0:\n        raise ValueError("Upper bound must be positive.")\n    return _sysrand._randbelow(exclusive_upper_bound)',
-                'dependencies': ['_sysrand._randbelow', 'ValueError'],
-                'file': 'secrets.py (Python standard library)',
-                'line': '25'
-            },
-            'secrets.randbytes': {
-                'signature': 'randbytes(n)',
-                'source': 'randbytes = _sysrand.randbytes',
-                'dependencies': ['_sysrand.randbytes'],
-                'file': 'secrets.py (Python standard library)',
-                'line': 'N/A'
-            },
-            'secrets.token_bytes': {
-                'signature': 'token_bytes(nbytes=None)',
-                'source': 'def token_bytes(nbytes=None):\n    if nbytes is None:\n        nbytes = DEFAULT_ENTROPY\n    return _sysrand.randbytes(nbytes)',
-                'dependencies': ['_sysrand.randbytes', 'DEFAULT_ENTROPY'],
-                'file': 'secrets.py (Python standard library)',
-                'line': '31'
-            }
-        }
-        return external_functions.get(qname)
         
     def _resolve_dependency(self, dep_name: str) -> Optional[str]:
         """Resolves a raw dependency string to a function name in the codebase."""
@@ -528,39 +469,14 @@ class _CallFinder(ast.NodeVisitor):
         elif isinstance(node.func, ast.Attribute):
             # Handle method calls like obj.method()
             if isinstance(node.func.value, ast.Name):
-                # For method calls, only add the full qualified name for user-defined functions
-                # Skip built-in methods like .add, .append, etc. on built-in types
-                method_name = node.func.attr
-                obj_name = node.func.value.id
-                
-                # Skip common built-in methods that are likely not user-defined functions
-                builtin_methods = {
-                    'add', 'append', 'remove', 'pop', 'clear', 'update', 'get', 'set',
-                    'keys', 'values', 'items', 'copy', 'extend', 'insert', 'reverse',
-                    'sort', 'count', 'index', 'replace', 'split', 'join', 'strip',
-                    'startswith', 'endswith', 'lower', 'upper', 'title', 'capitalize',
-                    'format', 'encode', 'decode', 'find', 'rfind', 'isdigit', 'isalpha',
-                    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close'
-                }
-                
-                if method_name not in builtin_methods:
-                    method_call = f"{obj_name}.{method_name}"
-                    self.calls.add(method_call)
+                # Add both the method call and just the method name
+                method_call = f"{node.func.value.id}.{node.func.attr}"
+                self.calls.add(method_call)
+                # Also add just the method name for cross-reference
+                self.calls.add(node.func.attr)
             else:
-                # Only add the method name if it's likely a user-defined method
-                method_name = node.func.attr
-                if method_name not in {'add', 'append', 'remove', 'pop', 'get', 'set', 'clear'}:
-                    self.calls.add(method_name)
-                
-        self.generic_visit(node)
-        
-    def visit_Name(self, node):
-        # Also detect variable/constant references that are loaded (not stored)
-        if isinstance(node.ctx, ast.Load):
-            # Only add names that look like constants (all caps) or known function names
-            name = node.id
-            if name.isupper() or name in {'callable', 'isinstance', 'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple'}:
-                self.calls.add(name)
+                # Add just the method name for complex attribute access
+                self.calls.add(node.func.attr)
                 
         self.generic_visit(node)
 
@@ -743,7 +659,6 @@ class CodebaseDependencyAnalyzer:
                 'success': True,
                 'function_found': search_result,
                 'dependencies': dependency_result,
-                'analyzer': dependency_result.get('analyzer'),  # Pass the analyzer from dependency result
                 'codebase_path': self.codebase_path,
                 'extracted_to': self.extracted_dir
             }
@@ -898,12 +813,33 @@ class CodebaseDependencyAnalyzer:
                 'error': f'Function {function_name} not found in analyzed functions'
             }
         
-        dependencies_result = analyzer.find_function_dependencies(found_function_name, organize_by_levels=True)
+        dependencies_result = analyzer.find_function_dependencies(found_function_name)
+        dependencies = dependencies_result['user_defined_order']
+        all_deps = dependencies_result['all_dependencies']
         
-        # Add the analyzer instance to the result for access to function details
-        dependencies_result['analyzer'] = analyzer
-        
-        return dependencies_result
+        # Get detailed information for each dependency
+        detailed_dependencies = []
+        for dep_name in dependencies:
+            if dep_name in analyzer.functions:
+                func_info = analyzer.functions[dep_name]
+                detailed_dependencies.append({
+                    'name': func_info.name,
+                    'file_path': func_info.file_path,
+                    'line_number': func_info.line_number,
+                    'signature': func_info.signature,
+                    'source_code': func_info.source_code,
+                    'docstring': func_info.docstring
+                })
+                
+        return {
+            'dependency_order': dependencies,
+            'detailed_dependencies': detailed_dependencies,
+            'total_dependencies': len(dependencies),
+            'analysis_method': 'python_ast_based',
+            'found_function_name': found_function_name,
+            'language': 'python',
+            'raw_calls': sorted(list(all_deps))
+        }
 
 
 def main():
@@ -969,7 +905,7 @@ Examples:
 
 
 def _format_text_output(result: Dict[str, Any]) -> str:
-    """Format result as human-readable text with level-based dependency organization"""
+    """Format result as human-readable text"""
     if 'error' in result:
         return f"Error: {result['error']}"
         
@@ -985,156 +921,39 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     output.append(f"Search method: {func_info['search_method']}")
     output.append("")
     
-    # Dependencies - organize by levels if available
+    # Dependencies
     deps = result['dependencies']
-    dependencies_by_level = deps.get('dependencies_by_level', {})
-    user_defined_deps = deps.get('user_defined_order', [])
-    external_deps = deps.get('external_dependencies', [])
+    output.append(f"Dependencies ({deps['total_dependencies']} total):")
+    output.append("-" * 30)
     
-    if dependencies_by_level:
-        output.append("Dependencies by Level:")
-        output.append("=" * 25)
+    for i, dep_name in enumerate(deps['dependency_order'], 1):
+        output.append(f"{i}. {dep_name}")
         
-        total_deps = sum(len(deps_set) for deps_set in dependencies_by_level.values())
-        output.append(f"Total Dependencies: {total_deps}")
-        output.append("")
-        
-        for level in sorted(dependencies_by_level.keys()):
-            level_deps = sorted(dependencies_by_level[level])
-            if level == 0:
-                level_name = "Direct Dependencies"
-            else:
-                level_name = f"Level-{level} Dependencies"
-                
-            output.append(f"{level_name} ({len(level_deps)} functions):")
-            output.append("-" * (len(level_name) + 20))
-            
-            for i, dep_name in enumerate(level_deps, 1):
-                output.append(f"  {i}. {dep_name}")
-            output.append("")
-    else:
-        # Fallback to flat organization
-        all_deps = user_defined_deps + external_deps
-        output.append(f"Dependencies ({len(all_deps)} total):")
-        output.append("-" * 30)
-        
-        for i, dep_name in enumerate(all_deps, 1):
-            output.append(f"{i}. {dep_name}")
-        output.append("")
+    output.append("")
 
-    # Show all detected calls if available
-    all_deps_detected = deps.get('all_dependencies', set())
-    if all_deps_detected:
-        output.append("All Detected Function/Method Calls:")
+    if 'raw_calls' in deps and deps['raw_calls']:
+        output.append("Raw Detected Function/Method Calls:")
         output.append("-" * 35)
-        sorted_detected = sorted(list(all_deps_detected))
-        for i in range(0, len(sorted_detected), 5):  # Show 5 per line
-            line_deps = sorted_detected[i:i+5]
-            output.append(", ".join(line_deps))
+        output.append(", ".join(deps['raw_calls']))
         output.append("")
     
-    # Detailed Dependency Information organized by levels
     output.append("Detailed Dependency Information:")
-    output.append("=" * 35)
+    output.append("-" * 35)
     
-    # Get the analyzer from the result to access function details
-    analyzer = result.get('analyzer')
-    if not analyzer:
-        output.append("(Function source code not available - analyzer instance not found)")
-        return "\n".join(output)
-    
-    # Show detailed info organized by levels if available
-    if dependencies_by_level:
-        for level in sorted(dependencies_by_level.keys()):
-            level_deps = sorted(dependencies_by_level[level])
-            if level == 0:
-                level_name = "DIRECT DEPENDENCIES"
-            else:
-                level_name = f"LEVEL-{level} DEPENDENCIES"
+    for dep in deps['detailed_dependencies']:
+        output.append(f"\nFunction: {dep['name']}")
+        output.append(f"  File: {dep['file_path']}")
+        output.append(f"  Line: {dep['line_number']}")
+        output.append(f"  Signature: {dep['signature']}")
+        
+        if dep['docstring']:
+            output.append(f"  Docstring: {dep['docstring']}")
             
-            output.append(f"\n{level_name}")
-            output.append("=" * len(level_name))
-            
-            for i, dep_name in enumerate(level_deps, 1):
-                output.append(f"\n{level}.{i} {dep_name}")
-                output.append("=" * (len(dep_name) + 10))
-                
-                # Get function info from the analyzer
-                if dep_name in analyzer.functions:
-                    func_info = analyzer.functions[dep_name]
-                    output.append(f"File: {func_info.file_path}")
-                    output.append(f"Line: {func_info.line_number}")
-                    output.append(f"Signature: {func_info.signature}")
-                    
-                    if func_info.docstring:
-                        output.append(f"Docstring: {func_info.docstring}")
-                    
-                    output.append("\nSource Code:")
-                    output.append("-" * 60)
-                    for line_num, line in enumerate(func_info.source_code.splitlines(), func_info.line_number):
-                        output.append(f"{line_num:4d}: {line}")
-                    output.append("-" * 60)
-                else:
-                    # Check if it's an external dependency with known info
-                    external_info = analyzer._get_external_function_info(dep_name)
-                    if external_info:
-                        output.append(f"File: {external_info['file']}")
-                        output.append(f"Line: {external_info['line']}")
-                        output.append(f"Signature: {external_info['signature']}")
-                        
-                        output.append("\nSource Code:")
-                        output.append("-" * 60)
-                        output.append(external_info['source'])
-                        output.append("-" * 60)
-                        
-                        # Show nested dependencies if any
-                        nested_deps = external_info.get('dependencies', [])
-                        if nested_deps:
-                            output.append(f"Nested Dependencies: {', '.join(nested_deps)}")
-                    else:
-                        output.append("(External dependency - source not available)")
-    else:
-        # Fallback to flat format
-        all_deps = user_defined_deps + external_deps
-        if all_deps:
-            for i, dep_name in enumerate(all_deps, 1):
-                output.append(f"\n{i}. {dep_name}")
-                output.append("=" * (len(dep_name) + 10))
-                
-                # Get function info from the analyzer
-                if dep_name in analyzer.functions:
-                    func_info = analyzer.functions[dep_name]
-                    output.append(f"File: {func_info.file_path}")
-                    output.append(f"Line: {func_info.line_number}")
-                    output.append(f"Signature: {func_info.signature}")
-                    
-                    if func_info.docstring:
-                        output.append(f"Docstring: {func_info.docstring}")
-                    
-                    output.append("\nSource Code:")
-                    output.append("-" * 60)
-                    for line_num, line in enumerate(func_info.source_code.splitlines(), func_info.line_number):
-                        output.append(f"{line_num:4d}: {line}")
-                    output.append("-" * 60)
-                else:
-                    # Check if it's an external dependency with known info
-                    external_info = analyzer._get_external_function_info(dep_name)
-                    if external_info:
-                        output.append(f"File: {external_info['file']}")
-                        output.append(f"Line: {external_info['line']}")
-                        output.append(f"Signature: {external_info['signature']}")
-                        
-                        output.append("\nSource Code:")
-                        output.append("-" * 60)
-                        output.append(external_info['source'])
-                        output.append("-" * 60)
-                        
-                        # Show nested dependencies if any
-                        nested_deps = external_info.get('dependencies', [])
-                        if nested_deps:
-                            output.append(f"Nested Dependencies: {', '.join(nested_deps)}")
-                    else:
-                        output.append("(External dependency - source not available)")
+        output.append(f"  Complete Source Code ({len(dep['source_code'].splitlines())} lines):")
+        output.append(f"  {'-' * 60}")
+        for line_num, line in enumerate(dep['source_code'].splitlines(), 1):
+            output.append(f"    {line_num:3d}: {line}")
+        output.append(f"  {'-' * 60}")
             
     return "\n".join(output)
 

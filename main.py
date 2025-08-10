@@ -43,6 +43,68 @@ try:
 except ImportError:
     WHEEL_SUPPORT = False
 
+# Module-level constants
+STDLIB_MODULES = {
+    'secrets': ['randbelow', 'randbytes', 'token_bytes', 'token_hex', 'choice'],
+    'random': ['randint', 'choice', 'shuffle', 'random', 'uniform', 'randrange'],
+    'os': ['path', 'environ', 'getcwd', 'listdir', 'mkdir', 'remove', 'rename'],
+    'sys': ['exit', 'argv', 'path', 'stdin', 'stdout', 'stderr'],
+    'json': ['loads', 'dumps', 'load', 'dump'],
+    'datetime': ['now', 'today', 'strptime', 'strftime'],
+    'time': ['time', 'sleep', 'strftime', 'strptime'],
+    'math': ['sqrt', 'pow', 'floor', 'ceil', 'sin', 'cos'],
+    'hashlib': ['md5', 'sha1', 'sha256', 'sha512'],
+    'uuid': ['uuid4', 'uuid1'],
+    'base64': ['b64encode', 'b64decode'],
+    'urllib': ['parse', 'request', 'error']
+}
+
+STDLIB_SUBMODULES = {
+    'os.path': ['exists', 'join', 'dirname', 'basename', 'abspath', 'isfile', 'isdir'],
+    'urllib.parse': ['urlencode', 'quote', 'unquote', 'urlparse', 'parse_qs'],
+    'urllib.request': ['urlopen', 'Request'],
+    'json.decoder': ['JSONDecodeError'],
+    'xml.etree.ElementTree': ['parse', 'fromstring', 'tostring']
+}
+
+BUILTIN_METHODS = {
+    'add', 'append', 'remove', 'pop', 'clear', 'update', 'get', 'set',
+    'keys', 'values', 'items', 'copy', 'extend', 'insert', 'reverse',
+    'sort', 'count', 'index', 'replace', 'split', 'join', 'strip',
+    'startswith', 'endswith', 'lower', 'upper', 'title', 'capitalize',
+    'format', 'encode', 'decode', 'find', 'rfind', 'isdigit', 'isalpha',
+    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close',
+    'appendleft', 'popleft', 'setdefault'
+}
+
+BUILTIN_ATTRS = {
+    'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'update', 'get', 'setdefault',
+    'keys', 'values', 'items', 'copy', 'sort', 'reverse', 'format', 'join', 'split',
+    'encode', 'decode', 'startswith', 'endswith', 'lower', 'upper', 'strip',
+    'appendleft', 'popleft'
+}
+
+# File size and processing constants
+MAX_FILE_SIZE_MB = 10
+DEFAULT_MAX_FUNCTIONS = 10000
+DEFAULT_MAX_WORKERS = 8
+
+
+@dataclass
+class DependencyInfo:
+    """Represents a function dependency"""
+    short_name: str
+    scope_tag: str  # 'CLASS_LOCAL', 'UNSCOPED', 'OBJ'
+    owner: Optional[str] = None  # For OBJ scope, the object name
+    
+    def __iter__(self):
+        """Allow tuple unpacking for backward compatibility"""
+        return iter((self.short_name, self.scope_tag, self.owner))
+    
+    def __getitem__(self, index):
+        """Allow tuple-like indexing for backward compatibility"""
+        return (self.short_name, self.scope_tag, self.owner)[index]
+
 
 @dataclass
 class FileMatch:
@@ -181,24 +243,21 @@ class ContentSearchEngine:
                 
                 # Skip very large files to prevent memory issues
                 file_stats = full_path.stat()
-                max_file_size = 10 * 1024 * 1024  # Standardized 10MB limit
+                max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
                 if file_stats.st_size > max_file_size:
                     print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB) in content search")
                     continue
                     
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                    
-                files_searched += 1
-                
-                for line_num, line in enumerate(content.splitlines(), 1):
-                    if regex.search(line):
-                        matches.append(FileMatch(
-                            file_path=str(file_path),
-                            line_number=line_num,
-                            line_content=line.strip(),
-                            match_score=1.0
-                        ))
+                    # Read line-by-line for better memory efficiency
+                    for line_num, line in enumerate(f, 1):
+                        if regex.search(line):
+                            matches.append(FileMatch(
+                                file_path=str(file_path),
+                                line_number=line_num,
+                                line_content=line.strip(),
+                                match_score=1.0
+                            ))
                         
             except (UnicodeDecodeError, PermissionError, FileNotFoundError, OSError):
                 # Skip files that can't be read due to encoding, permissions, or other OS errors
@@ -243,7 +302,7 @@ class ContentSearchEngine:
 class PythonDependencyAnalyzer:
     """Analyzes Python code dependencies using AST"""
     
-    def __init__(self, root_dir: str, max_functions_in_memory: int = 10000, enforce_memory_limit: bool = False):
+    def __init__(self, root_dir: str, max_functions_in_memory: int = DEFAULT_MAX_FUNCTIONS, enforce_memory_limit: bool = False):
         self.root_dir = Path(root_dir).resolve()
         self.functions: Dict[str, FunctionInfo] = {}
         self.classes: Dict[str, Dict[str, FunctionInfo]] = {}
@@ -265,7 +324,7 @@ class PythonDependencyAnalyzer:
         try:
             # Check file size to avoid loading extremely large files
             file_stats = full_path.stat()
-            max_file_size = 10 * 1024 * 1024  # Standardized 10MB limit
+            max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
             if file_stats.st_size > max_file_size:
                 print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
                 return []
@@ -302,6 +361,7 @@ class PythonDependencyAnalyzer:
         self._analysis_stats = {
             'total_files': len(python_files),
             'skipped_files': 0,
+            'rejected_functions': 0,  # Track function rejections separately
             'parsed_functions': 0,
             'analysis_start_time': time.time()
         }
@@ -335,6 +395,8 @@ class PythonDependencyAnalyzer:
         print(f"Analysis complete: {self._analysis_stats['parsed_functions']} functions parsed in {analysis_time:.2f}s")
         if self._analysis_stats['skipped_files'] > 0:
             print(f"Skipped {self._analysis_stats['skipped_files']} files due to size/parse errors")
+        if self._analysis_stats.get('rejected_functions', 0) > 0:
+            print(f"Rejected {self._analysis_stats['rejected_functions']} functions due to memory limits")
         
     def _is_internal(self, qname: str) -> bool:
         """Check if a qualified name is internal to the project"""
@@ -349,7 +411,7 @@ class PythonDependencyAnalyzer:
             
     def _analyze_files_parallel(self, python_files: List[str]) -> None:
         """Analyze files in parallel (for large codebases)"""
-        max_workers = min(8, len(python_files))  # Don't use too many threads
+        max_workers = min(DEFAULT_MAX_WORKERS, len(python_files))  # Use constant
         total_files = len(python_files)
         processed_files = 0
         
@@ -392,9 +454,9 @@ class PythonDependencyAnalyzer:
                 
                 if self.enforce_memory_limit:
                     print(f"Memory limit enforcement enabled. Rejecting {len(functions)} functions to stay within limit.")
-                    # Update stats for rejected functions
+                    # Update stats for rejected functions - not files
                     if hasattr(self, '_analysis_stats'):
-                        self._analysis_stats['skipped_files'] += 1
+                        self._analysis_stats['rejected_functions'] += len(functions)
                     return
                 else:
                     print("Consider using smaller codebases or increasing max_functions_in_memory, or enable enforce_memory_limit=True.")
@@ -454,13 +516,13 @@ class PythonDependencyAnalyzer:
 
         resolved_edges: Dict[str, Set[str]] = defaultdict(set)
         visited = {start}
-        queue = [(start, 0)]
+        queue = deque([(start, 0)])  # Use deque for O(1) operations
         all_raw_shortnames = set()
         external_dependencies = set()
         dependencies_by_level = {} if organize_by_levels else None
 
         while queue:
-            cur, level = queue.pop(0)
+            cur, level = queue.popleft()  # O(1) operation instead of list.pop(0)
             finfo = self.func_by_qname.get(cur)
             if not finfo:
                 continue
@@ -642,7 +704,7 @@ class PythonDependencyAnalyzer:
             func = parts[-1]
             
             # Generate basic info for stdlib modules
-            stdlib_modules = ['secrets', 'random', 'os', 'sys', 'json', 'datetime', 'time', 'math', 'hashlib', 'uuid', 'base64']
+            stdlib_modules = list(STDLIB_MODULES.keys())
             if module in stdlib_modules:
                 return {
                     'signature': f'{func}(...)',
@@ -748,20 +810,7 @@ class PythonDependencyAnalyzer:
         aliases = self.module_aliases.get(caller_mod, {})
         
         # Common stdlib patterns
-        stdlib_modules = {
-            'secrets': ['randbelow', 'randbytes', 'token_bytes', 'token_hex', 'choice'],
-            'random': ['randint', 'choice', 'shuffle', 'random', 'uniform', 'randrange'],
-            'os': ['path', 'environ', 'getcwd', 'listdir', 'mkdir', 'remove', 'rename'],
-            'sys': ['exit', 'argv', 'path', 'stdin', 'stdout', 'stderr'],
-            'json': ['loads', 'dumps', 'load', 'dump'],
-            'datetime': ['now', 'today', 'strptime', 'strftime'],
-            'time': ['time', 'sleep', 'strftime', 'strptime'],
-            'math': ['sqrt', 'pow', 'floor', 'ceil', 'sin', 'cos'],
-            'hashlib': ['md5', 'sha1', 'sha256', 'sha512'],
-            'uuid': ['uuid4', 'uuid1'],
-            'base64': ['b64encode', 'b64decode'],
-            'urllib': ['parse', 'request', 'error']
-        }
+        stdlib_modules = STDLIB_MODULES
         
         # 1. Check if short name belongs to known stdlib modules
         for module, functions in stdlib_modules.items():
@@ -785,15 +834,31 @@ class PythonDependencyAnalyzer:
             if not any(target_mod.startswith(prefix) for prefix in self.project_prefixes):
                 return f"{target_mod}.{short}"
         
-        # 4. Direct module references (e.g., os.path.exists)
+        # 4. Direct module references and complex paths (e.g., os.path.exists)
         if scope == 'OBJ' and owner:
-            # Check if owner is a known stdlib module
+            # Check if owner is a known stdlib module or submodule
             for module in stdlib_modules:
-                if owner == module or owner.startswith(f"{module}."):
-                    # Verify it's imported
+                if owner == module:
+                    # Direct module reference: os.getcwd, json.loads, etc.
                     for imp in imports:
-                        if imp.startswith(owner):
+                        if imp == module or imp.startswith(f"{module}."):
                             return f"{owner}.{short}"
+                elif owner.startswith(f"{module}."):
+                    # Submodule reference: os.path.exists
+                    for imp in imports:
+                        if imp.startswith(module):
+                            return f"{owner}.{short}"
+            
+            # Check for complex stdlib paths like urllib.parse.urlencode
+            stdlib_submodules = STDLIB_SUBMODULES
+            
+            for submodule, functions in stdlib_submodules.items():
+                if short in functions and (owner == submodule or owner in submodule):
+                    # Check if base module is imported
+                    base_module = submodule.split('.')[0]
+                    for imp in imports:
+                        if imp.startswith(base_module):
+                            return f"{submodule}.{short}"
         
         return None
     
@@ -852,36 +917,43 @@ class _CallFinder(ast.NodeVisitor):
             # Direct function calls like function_name() or ClassName()
             self.calls.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
-            # Handle method calls like obj.method()
+            # Handle method calls like obj.method() or obj.subobj.method()
             if isinstance(node.func.value, ast.Name):
-                # For method calls, only add the full qualified name for user-defined functions
-                # Skip built-in methods like .add, .append, etc. on built-in types
+                # Simple case: obj.method()
                 method_name = node.func.attr
                 obj_name = node.func.value.id
                 
                 # Skip common built-in methods that are likely not user-defined functions
-                builtin_methods = {
-                    'add', 'append', 'remove', 'pop', 'clear', 'update', 'get', 'set',
-                    'keys', 'values', 'items', 'copy', 'extend', 'insert', 'reverse',
-                    'sort', 'count', 'index', 'replace', 'split', 'join', 'strip',
-                    'startswith', 'endswith', 'lower', 'upper', 'title', 'capitalize',
-                    'format', 'encode', 'decode', 'find', 'rfind', 'isdigit', 'isalpha',
-                    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close',
-                    'appendleft', 'popleft', 'setdefault'
-                }
+                builtin_methods = BUILTIN_METHODS
                 
                 if method_name not in builtin_methods:
                     method_call = f"{obj_name}.{method_name}"
                     self.calls.add(method_call)
+            elif isinstance(node.func.value, ast.Attribute):
+                # Complex case: obj.subobj.method() -> need to build the full chain
+                method_name = node.func.attr
+                chain_parts = []
+                current = node.func.value
+                
+                # Walk up the attribute chain
+                while isinstance(current, ast.Attribute):
+                    chain_parts.append(current.attr)
+                    current = current.value
+                
+                if isinstance(current, ast.Name):
+                    chain_parts.append(current.id)
+                    chain_parts.reverse()
+                    
+                    # For complex chains like os.path.exists, we want to capture
+                    # the immediate parent as the owner: path.exists
+                    if len(chain_parts) >= 2:
+                        owner = chain_parts[-1]  # 'path' in os.path.exists
+                        full_call = f"{owner}.{method_name}"
+                        self.calls.add(full_call)
             else:
                 # Only add the method name if it's likely a user-defined method
                 method_name = node.func.attr
-                builtin_attrs = {
-                    'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'update', 'get', 'setdefault',
-                    'keys', 'values', 'items', 'copy', 'sort', 'reverse', 'format', 'join', 'split',
-                    'encode', 'decode', 'startswith', 'endswith', 'lower', 'upper', 'strip',
-                    'appendleft', 'popleft'
-                }
+                builtin_attrs = BUILTIN_ATTRS
                 if method_name not in builtin_attrs:
                     self.calls.add(method_name)
                 
@@ -1299,7 +1371,7 @@ class CodebaseDependencyAnalyzer:
         
         # If it's just a function name without code structure
         if stripped and stripped.replace('.', '_').replace('_', '').isalnum():
-            return stripped
+            return stripped.strip()  # Ensure proper stripping
                 
         return None
         

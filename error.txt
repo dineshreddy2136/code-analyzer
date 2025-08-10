@@ -1,3 +1,0 @@
-    
-    def generate_model_report(self, model, test_x, test_y):
-        """Generate a comprehensive model evaluation report"""

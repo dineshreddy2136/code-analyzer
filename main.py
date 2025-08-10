@@ -578,7 +578,7 @@ class PythonDependencyAnalyzer:
             if r:
                 resolved_once.append(r)
 
-        user_defined_direct_deps = {r for r in resolved_once if r != function_name}
+        user_defined_direct_deps = {r for r in resolved_once if r != function_name and r in self.func_by_qname}
         
         if not user_defined_direct_deps:
             return {}
@@ -586,7 +586,7 @@ class PythonDependencyAnalyzer:
         # Build nested levels by tracing this function's specific dependency chain
         nested_levels = {}
         
-        # Level 2: Direct dependencies of this function
+        # Level 2: Direct dependencies of this function (user-defined only for first level)
         nested_levels[2] = user_defined_direct_deps
         
         current_level_deps = user_defined_direct_deps
@@ -603,16 +603,21 @@ class PythonDependencyAnalyzer:
                     dep_dependencies = self.func_by_qname[dep].dependencies
                     resolved_deps = set()
                     for d in dep_dependencies:
+                        # Try both internal and external dependency resolution
                         r = self._resolve_dependency(dep, d)
-                        if r:
+                        if not r:
+                            r = self._resolve_external_dependency(dep, d)
+                        if r and r != dep:
                             resolved_deps.add(r)
-                    # Only include user-defined functions that haven't been visited
-                    resolved_deps = {d for d in resolved_deps if d not in visited_deps and d in self.func_by_qname}
-                    next_level_deps.update(resolved_deps)
+                    
+                    # Include both user-defined and external dependencies that haven't been visited
+                    all_new_deps = {d for d in resolved_deps if d not in visited_deps}
+                    next_level_deps.update(all_new_deps)
             
             if next_level_deps:
                 nested_levels[level] = next_level_deps
-                current_level_deps = next_level_deps
+                # Only continue with user-defined functions for further traversal
+                current_level_deps = {d for d in next_level_deps if d in self.func_by_qname}
             else:
                 break
                 

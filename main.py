@@ -65,6 +65,8 @@ class FunctionInfo:
     imports: Set[str] = field(default_factory=set)
     signature: str = ""
     docstring: str = ""
+    source_aliases: Dict[str, str] = field(default_factory=dict)
+    kind: str = "inst"  # 'inst' | 'static' | 'class'
 
 
 @dataclass
@@ -252,6 +254,7 @@ class PythonDependencyAnalyzer:
         self.module_of: Dict[str, str] = {}                        # qname -> 'pkg.mod'
         self.class_of: Dict[str, Optional[str]] = {}               # qname -> class or None
         self.project_prefixes: Set[str] = set()                    # internal top-level packages
+        self.module_aliases: Dict[str, Dict[str, str]] = defaultdict(dict)  # 'pkg.mod' -> {'bar': 'pkg.utils.foo'}
         
     def analyze_file(self, file_path: str) -> List[FunctionInfo]:
         """Analyze a Python file and extract function information"""
@@ -296,13 +299,17 @@ class PythonDependencyAnalyzer:
             self._analyze_files_sequential(python_files)
             
         # Mark internal packages (so stdlib/Django don't leak in)
+        SKIP_TOPS = {'__pycache__'}
+        def _is_meta_dir(name: str) -> bool:
+            return name.endswith(('.dist-info', '.data', '.egg-info'))
+            
         prefixes = set()
         for root, _, files in os.walk(self.root_dir):
             for f in files:
                 if f.endswith('.py'):
                     rel_dir = Path(root).relative_to(self.root_dir)
                     top = rel_dir.parts[0] if rel_dir.parts else Path(f).stem
-                    if top and top not in ('__pycache__',):
+                    if top and top not in SKIP_TOPS and not _is_meta_dir(top):
                         prefixes.add(top)
         self.project_prefixes = prefixes
         print(f"Project prefixes (internal): {sorted(self.project_prefixes)}")
@@ -374,6 +381,10 @@ class PythonDependencyAnalyzer:
                 short = func.signature.split('(')[0] if func.signature else parts[-1]
                 self.short_index[short].add(q)
                 
+                # Store module-level aliases
+                mod = self.module_of[q]
+                self.module_aliases.setdefault(mod, {}).update(func.source_aliases)
+                
     def find_function_dependencies(self, function_name: str, organize_by_levels: bool = False) -> Dict[str, Any]:
         """Find all dependencies for a function in correct order, optionally organized by levels"""
         # accept qualified or short; map short→unique if possible
@@ -383,8 +394,10 @@ class PythonDependencyAnalyzer:
             if len(bucket) == 1:
                 start = next(iter(bucket))
             else:
+                candidates = []
                 if bucket:
-                    sample = ', '.join(list(sorted(bucket))[:5])
+                    candidates = list(sorted(bucket))[:5]
+                    sample = ', '.join(candidates)
                     print(f"Function '{function_name}' ambiguous. Candidates: {sample}...")
                 else:
                     print(f"Function '{function_name}' not found.")
@@ -393,7 +406,9 @@ class PythonDependencyAnalyzer:
                     'all_dependencies': set(),
                     'total_calls': 0,
                     'external_dependencies': [],
-                    'dependencies_by_level': {} if organize_by_levels else None
+                    'dependencies_by_level': {} if organize_by_levels else None,
+                    'ambiguous_function': True,
+                    'candidates': candidates
                 }
 
         resolved_edges: Dict[str, Set[str]] = defaultdict(set)
@@ -430,6 +445,8 @@ class PythonDependencyAnalyzer:
                         visited.add(tgt)
                         queue.append((tgt, level+1))
 
+        # Ensure edges only include nodes present in visited set
+        resolved_edges = {u: {v for v in vs if v in visited} for u, vs in resolved_edges.items()}
         ordered = self._topological_sort_resolved(visited, resolved_edges)
         if ordered and ordered[0] == start:
             ordered = ordered[1:]
@@ -543,8 +560,29 @@ class PythonDependencyAnalyzer:
         cand = f"{caller_mod}.{short}"
         if cand in self.func_by_qname:
             return cand
+            
+        # 3) Check for import aliases in UNSCOPED calls
+        if scope == 'UNSCOPED':
+            aliases = self.module_aliases.get(caller_mod, {})
+            if short in aliases:
+                target = aliases[short]
+                # If it's a fully-qualified function import:
+                if target in self.func_by_qname and self._is_internal(target):
+                    return target
+                # If it's a module alias and we can form "module.short"
+                if '.' in target:  # module reference
+                    cand = f"{target}.{short}"
+                    if cand in self.func_by_qname and self._is_internal(cand):
+                        return cand
+                        
+        # 4) Check for same-class static/classmethod calls (Class.method from within Class)
+        if scope == 'AMBIGUOUS_OBJ' and caller_cls:
+            # The original call might be "ClassName.method" which we normalized to just "method"
+            cand = f"{caller_mod}.{caller_cls}.{short}"
+            if cand in self.func_by_qname:
+                return cand
 
-        # 3) unique across project
+        # 5) unique across project
         bucket = self.short_index.get(short, set())
         if len(bucket) == 1:
             return next(iter(bucket))
@@ -598,7 +636,8 @@ class _CallFinder(ast.NodeVisitor):
                     'sort', 'count', 'index', 'replace', 'split', 'join', 'strip',
                     'startswith', 'endswith', 'lower', 'upper', 'title', 'capitalize',
                     'format', 'encode', 'decode', 'find', 'rfind', 'isdigit', 'isalpha',
-                    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close'
+                    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close',
+                    'appendleft', 'popleft', 'setdefault'
                 }
                 
                 if method_name not in builtin_methods:
@@ -607,7 +646,13 @@ class _CallFinder(ast.NodeVisitor):
             else:
                 # Only add the method name if it's likely a user-defined method
                 method_name = node.func.attr
-                if method_name not in {'add', 'append', 'remove', 'pop', 'get', 'set', 'clear'}:
+                builtin_attrs = {
+                    'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'update', 'get', 'setdefault',
+                    'keys', 'values', 'items', 'copy', 'sort', 'reverse', 'format', 'join', 'split',
+                    'encode', 'decode', 'startswith', 'endswith', 'lower', 'upper', 'strip',
+                    'appendleft', 'popleft'
+                }
+                if method_name not in builtin_attrs:
                     self.calls.add(method_name)
                 
         self.generic_visit(node)
@@ -623,16 +668,25 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         self.functions: List[FunctionInfo] = []
         self.current_class = None
         self.imports = set()
+        self.local_aliases: Dict[str, str] = {}  # local_name -> fully_qualified_target
         
     def visit_Import(self, node):
         for alias in node.names:
+            # import pkg.utils as u
+            fq = alias.name  # 'pkg.utils'
+            local = alias.asname or alias.name.split('.')[-1]
+            self.local_aliases[local] = fq
             self.imports.add(alias.name)
         self.generic_visit(node)
         
     def visit_ImportFrom(self, node):
-        module = node.module or ""
+        base = node.module or ""
         for alias in node.names:
-            self.imports.add(f"{module}.{alias.name}" if module else alias.name)
+            local = alias.asname or alias.name
+            # from pkg.utils import foo as bar => 'pkg.utils.foo'
+            target = f"{base}.{alias.name}" if base else alias.name
+            self.local_aliases[local] = target
+            self.imports.add(f"{base}.{alias.name}" if base else alias.name)
         self.generic_visit(node)
         
     def visit_FunctionDef(self, node):
@@ -655,7 +709,11 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         """Extract function information from AST node"""
         func_name = node.name
         # qualify by module path from file path
-        mod = str(Path(self.file_path).with_suffix('')).replace(os.sep, '.')
+        p = Path(self.file_path)
+        if p.name == '__init__.py':
+            mod = str(p.parent).replace(os.sep, '.')
+        else:
+            mod = str(p.with_suffix('')).replace(os.sep, '.')
         if self.current_class:
             full_func_name = f"{mod}.{self.current_class}.{func_name}"
         else:
@@ -668,6 +726,11 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
 
         signature = self._get_function_signature(node)
         docstring = ast.get_docstring(node) or ""
+        
+        # Detect decorator types
+        is_static = any(isinstance(d, ast.Name) and d.id == 'staticmethod' for d in node.decorator_list)
+        is_class = any(isinstance(d, ast.Name) and d.id == 'classmethod' for d in node.decorator_list)
+        func_kind = 'static' if is_static else ('class' if is_class else 'inst')
 
         call_finder = _CallFinder()
         call_finder.visit(node)
@@ -695,7 +758,9 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
             calls=set(x[0] for x in normalized),         # shortnames, for display only
             imports=self.imports.copy(),
             signature=signature,
-            docstring=docstring
+            docstring=docstring,
+            source_aliases=self.local_aliases.copy(),
+            kind=func_kind
         )
         
     def _get_function_signature(self, node) -> str:
@@ -1021,6 +1086,23 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     """Format result as human-readable text with level-based dependency organization"""
     if 'error' in result:
         return f"Error: {result['error']}"
+        
+    # Check for ambiguous function
+    if result.get('ambiguous_function'):
+        output = ["Codebase Dependency Analysis Results"]
+        output.append("=" * 40)
+        output.append("")
+        output.append("⚠️  Function name is ambiguous!")
+        candidates = result.get('candidates', [])
+        if candidates:
+            output.append("Available candidates:")
+            for i, cand in enumerate(candidates, 1):
+                output.append(f"  {i}. {cand}")
+            output.append("")
+            output.append("Please specify the full qualified name (e.g., 'pkg.module.Class.method')")
+        else:
+            output.append("No matching functions found in the codebase.")
+        return "\n".join(output)
         
     output = ["Codebase Dependency Analysis Results"]
     output.append("=" * 40)

@@ -316,10 +316,15 @@ class ContentSearchEngine:
                                 line_content=line.strip(),
                                 match_score=1.0
                             ))
+                            if len(matches) >= max_results:
+                                break  # stop scanning this file
                         
             except (UnicodeDecodeError, PermissionError, FileNotFoundError, OSError):
                 # Skip files that can't be read due to encoding, permissions, or other OS errors
                 continue
+                
+            if len(matches) >= max_results:
+                break  # stop scanning further files
                 
         search_time = time.time() - start_time
         return SearchResult(
@@ -402,7 +407,7 @@ class PythonDependencyAnalyzer:
                 source = f.read()
                 
             tree = ast.parse(source)
-            analyzer = _PythonASTAnalyzer(relative_path, source)
+            analyzer = _PythonASTAnalyzer(relative_path, source, tree)
             analyzer.visit(tree)
             
             # Simply return the functions - let callers handle storage via _store_functions
@@ -622,15 +627,13 @@ class PythonDependencyAnalyzer:
             ordered = ordered[1:]
 
         final_order = ordered + sorted(external_dependencies)
-        out = {
-            'user_defined_order': final_order,
-            'all_dependencies': all_raw_shortnames,
+        return {
+            'user_defined_order': list(final_order),
+            'all_dependencies': sorted(all_raw_shortnames),
             'total_calls': len(all_raw_shortnames),
-            'external_dependencies': sorted(external_dependencies)
+            'external_dependencies': sorted(external_dependencies),
+            'dependencies_by_level': {int(k): sorted(v) for k, v in (dependencies_by_level or {}).items()} if organize_by_levels else None
         }
-        if organize_by_levels:
-            out['dependencies_by_level'] = dependencies_by_level
-        return out
 
     def _get_nested_dependency_levels(self, function_name: str, global_dependencies_by_level: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
         """Get the nested dependency levels for a specific function"""
@@ -1038,27 +1041,36 @@ class PythonDependencyAnalyzer:
         
     def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> List[str]:
         """Sort functions in dependency order using resolved edges"""
-        in_deg = {n: 0 for n in nodes}
-        for u in nodes:
-            for v in edges.get(u, ()):
+        # Use sorted lists everywhere for deterministic output
+        nodes_sorted = sorted(nodes)
+        edges_sorted = {u: set(sorted(vs)) for u, vs in edges.items()}
+
+        in_deg = {n: 0 for n in nodes_sorted}
+        for u in nodes_sorted:
+            for v in edges_sorted.get(u, ()):
                 if v in in_deg:
                     in_deg[v] += 1
-        q = deque([n for n, d in in_deg.items() if d == 0])
+
+        # Always pop smallest-name node first for stability
+        q = deque(sorted([n for n, d in in_deg.items() if d == 0]))
         out = []
         while q:
             u = q.popleft()
             out.append(u)
-            for v in edges.get(u, ()):
+            for v in sorted(edges_sorted.get(u, ())):
                 in_deg[v] -= 1
                 if in_deg[v] == 0:
-                    q.append(v)
-        if len(out) < len(nodes):
+                    # Insert maintaining sort order
+                    # (small queue: O(n) insert is fine for stability)
+                    idx = 0
+                    while idx < len(q) and q[idx] < v:
+                        idx += 1
+                    q.insert(idx, v)
+
+        if len(out) < len(nodes_sorted):
             cyc = [n for n, d in in_deg.items() if d > 0]
-            cyc_count = len(cyc)
-            cyc_sample = cyc[:5]
-            logging.warning(f"{cyc_count} function(s) in cycle(s): {cyc_sample}{'...' if cyc_count > 5 else ''}")
-            print(f"  This may result in incomplete dependency ordering.")
-            # Still return partial order - better than nothing
+            logging.warning(f"{len(cyc)} function(s) in cycle(s): {cyc[:5]}{'...' if len(cyc)>5 else ''}")
+            print("  This may result in incomplete dependency ordering.")
         return out
 
 
@@ -1195,7 +1207,7 @@ class _ImportFinder(ast.NodeVisitor):
 class _PythonASTAnalyzer(ast.NodeVisitor):
     """AST visitor for analyzing Python function dependencies"""
     
-    def __init__(self, file_path: str, source: str):
+    def __init__(self, file_path: str, source: str, tree: ast.AST):
         self.file_path = file_path
         self.source = source
         self.source_lines = source.splitlines()
@@ -1205,7 +1217,6 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         # Use _ImportFinder to handle all module-level imports
         import_finder = _ImportFinder()
         import_finder.file_path = file_path  # Add file_path for logging
-        tree = ast.parse(source)
         import_finder.visit(tree)
         self.imports = import_finder.imports
         self.local_aliases = import_finder.aliases
@@ -1226,15 +1237,24 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
         self.current_class = old_class
         
+    def _path_to_module(self, p: Path) -> str:
+        """Convert file path to valid Python module name"""
+        mod = str((p.parent if p.name == '__init__.py' else p.with_suffix(''))).replace(os.sep, '.')
+        # sanitize each segment into a valid identifier
+        parts = []
+        for seg in mod.split('.'):
+            seg = re.sub(r'[^0-9a-zA-Z_]', '_', seg)
+            if re.match(r'^\d', seg):
+                seg = '_' + seg
+            parts.append(seg or '_')
+        return '.'.join(parts)
+        
     def _extract_function_info(self, node) -> FunctionInfo:
         """Extract function information from AST node"""
         func_name = node.name
         # qualify by module path from file path
         p = Path(self.file_path)
-        if p.name == '__init__.py':
-            mod = str(p.parent).replace(os.sep, '.')
-        else:
-            mod = str(p.with_suffix('')).replace(os.sep, '.')
+        mod = self._path_to_module(p)
         if self.current_class:
             full_func_name = f"{mod}.{self.current_class}.{func_name}"
         else:
@@ -1325,6 +1345,24 @@ class CodebaseExtractor:
         self.temp_dir = temp_dir or tempfile.mkdtemp()
         self.extracted_path: Optional[Path] = None
         
+    def _safe_extract(self, zip_ref: zipfile.ZipFile, extract_dir: Path) -> None:
+        """Safely extract zip file preventing zip slip attacks"""
+        extract_dir = extract_dir.resolve()
+        for member in zip_ref.infolist():
+            # Block absolute/drive-letter paths and parent traversals
+            name = Path(member.filename)
+            if name.is_absolute():
+                raise ValueError(f"Unsafe entry (absolute): {name}")
+            dest = (extract_dir / name).resolve()
+            if extract_dir not in dest.parents and dest != extract_dir:
+                raise ValueError(f"Unsafe entry (traversal): {name}")
+            if member.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zip_ref.open(member) as src, open(dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        
     def extract_archive(self, archive_path: str) -> str:
         """Extract .zip or .whl file and return extraction path"""
         archive_path = Path(archive_path)
@@ -1342,7 +1380,7 @@ class CodebaseExtractor:
         # Extract as zip file (both .zip and .whl are zip formats)
         try:
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
+                self._safe_extract(zip_ref, extract_dir)
                 
             self.extracted_path = extract_dir
             return str(extract_dir)
@@ -1359,11 +1397,15 @@ class CodebaseExtractor:
 class AnalysisRunner:
     """Main application class"""
     
-    def __init__(self, codebase_path: str, function_snippet_file: str):
+    def __init__(self, codebase_path: str, function_snippet_file: str, 
+                 max_functions_in_memory: int = DEFAULT_MAX_FUNCTIONS,
+                 enforce_memory_limit: bool = False):
         self.codebase_path = codebase_path
         self.function_snippet_file = function_snippet_file
         self.extractor = CodebaseExtractor()
         self.extracted_dir: Optional[str] = None
+        self.max_functions_in_memory = max_functions_in_memory
+        self.enforce_memory_limit = enforce_memory_limit
         
     def run(self) -> Dict[str, Any]:
         """Run the complete analysis"""
@@ -1559,7 +1601,11 @@ class AnalysisRunner:
     def _analyze_dependencies(self, function_info: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze function dependencies"""
         # Only analyze Python codebases
-        analyzer = PythonDependencyAnalyzer(self.extracted_dir)
+        analyzer = PythonDependencyAnalyzer(
+            self.extracted_dir, 
+            max_functions_in_memory=self.max_functions_in_memory,
+            enforce_memory_limit=self.enforce_memory_limit
+        )
         
         # Analyze entire codebase
         analyzer.analyze_codebase()
@@ -1625,10 +1671,23 @@ class AnalysisRunner:
         return dependencies_result
 
 
+def emit_dot(edges: Dict[str, Set[str]], start: str) -> str:
+    """Emit dependencies as Graphviz DOT format"""
+    lines = ["digraph deps {"]
+    lines.append('  node [shape=box];')
+    lines.append(f'  "{start}" [style=filled,fillcolor=lightblue];')
+    
+    for u, vs in sorted(edges.items()):
+        for v in sorted(vs):
+            lines.append(f'  "{u}" -> "{v}";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def main():
     """Main entry point"""
-    # Configure logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Declare globals early
+    global MAX_FILE_SIZE_MB, DEFAULT_MAX_WORKERS
     
     parser = argparse.ArgumentParser(
         description='Analyze Python codebase dependencies from function snippet',
@@ -1645,8 +1704,32 @@ Examples:
     parser.add_argument('--output', '-o', help='Output file for results (default: stdout)')
     parser.add_argument('--format', choices=['json', 'text'], default='text',
                        help='Output format (default: text)')
+    parser.add_argument('--max-workers', type=int, default=DEFAULT_MAX_WORKERS,
+                       help=f'Maximum number of worker threads (default: {DEFAULT_MAX_WORKERS})')
+    parser.add_argument('--max-functions', type=int, default=DEFAULT_MAX_FUNCTIONS,
+                       help=f'Maximum functions to keep in memory (default: {DEFAULT_MAX_FUNCTIONS})')  
+    parser.add_argument('--max-file-mb', type=int, default=MAX_FILE_SIZE_MB,
+                       help=f'Maximum file size in MB to process (default: {MAX_FILE_SIZE_MB})')
+    parser.add_argument('--enforce-memory-limit', action='store_true',
+                       help='Enforce memory limits strictly (may reduce accuracy)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose logging')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                       help='Minimize output (only errors and results)')
+    parser.add_argument('--emit', choices=['text', 'json', 'dot'], default='text',
+                       help='Output format: text (human-readable), json (structured), dot (Graphviz)')
     
     args = parser.parse_args()
+    
+    # Configure logging based on verbosity
+    if args.quiet:
+        log_level = logging.ERROR
+    elif args.verbose:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.INFO
+    
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
     
     # Validate inputs
     if not os.path.exists(args.codebase):
@@ -1663,13 +1746,41 @@ Examples:
         print(f"Error: Unsupported codebase file type: {codebase_ext}. Expected .zip or .whl", file=sys.stderr)
         return 1
         
+    # Update the global variables with user settings
+    MAX_FILE_SIZE_MB = args.max_file_mb
+    DEFAULT_MAX_WORKERS = args.max_workers
+        
     # Run analysis
-    runner = AnalysisRunner(args.codebase, args.snippet)
+    runner = AnalysisRunner(
+        args.codebase, 
+        args.snippet,
+        max_functions_in_memory=args.max_functions,
+        enforce_memory_limit=args.enforce_memory_limit
+    )
     result = runner.run()
     
     # Format output
-    if args.format == 'json':
-        output = json.dumps(result, indent=2, default=str)
+    if args.emit == 'json':
+        result_json = dict(result)
+        result_json.pop('analyzer', None)
+        if 'dependencies' in result_json and isinstance(result_json['dependencies'], dict):
+            result_json['dependencies'].pop('analyzer', None)
+        output = json.dumps(result_json, indent=2)
+    elif args.emit == 'dot':
+        # Extract edges from result for DOT format  
+        deps = result.get('dependencies', {})
+        if 'error' not in deps:
+            function_name = result.get('function', {}).get('function_name', 'unknown')
+            # Create a simple dependency graph
+            edges = {}
+            user_defined_order = deps.get('user_defined_order', [])
+            for i, func in enumerate(user_defined_order[1:], 1):
+                if i > 0:
+                    prev_func = user_defined_order[i-1] 
+                    edges.setdefault(prev_func, set()).add(func)
+            output = emit_dot(edges, function_name)
+        else:
+            output = f"Error: {deps['error']}"
     else:
         output = _format_text_output(result)
         
@@ -1704,8 +1815,23 @@ def _format_text_output(result: Dict[str, Any]) -> str:
             cands = deps.get('candidates', [])
             if cands:
                 output.append("Available candidates:")
-                for i, cand in enumerate(cands[:10], 1):  # Show max 10
-                    output.append(f"  {i}. {cand}")
+                # Show shortest qualifying names first and include file paths
+                cands_with_paths = []
+                for cand in cands[:10]:  # Show max 10
+                    # Extract function info to get file path
+                    analyzer = deps.get('analyzer')
+                    file_path = "unknown"
+                    if analyzer and hasattr(analyzer, 'func_by_qname'):
+                        func_info = analyzer.func_by_qname.get(cand)
+                        if func_info:
+                            file_path = func_info.file_path
+                    cands_with_paths.append((cand, file_path))
+                
+                # Sort by shortest name first
+                cands_with_paths.sort(key=lambda x: (len(x[0]), x[0]))
+                
+                for i, (cand, file_path) in enumerate(cands_with_paths, 1):
+                    output.append(f"  {i}. {cand} (in {file_path})")
                 output.append("")
                 output.append("Please specify the fully qualified name (e.g., test.models.UserRepository.save)")
             return "\n".join(output)
@@ -1758,10 +1884,7 @@ def _format_text_output(result: Dict[str, Any]) -> str:
         
         for level in sorted(dependencies_by_level.keys()):
             level_deps = sorted(dependencies_by_level[level])
-            if level == 0:
-                level_name = "Direct Dependencies"
-            else:
-                level_name = f"Level-{level} Dependencies"
+            level_name = "Direct Dependencies" if level == 1 else f"Level-{level} Dependencies"
                 
             output.append(f"{level_name} ({len(level_deps)} functions):")
             output.append("-" * (len(level_name) + 20))

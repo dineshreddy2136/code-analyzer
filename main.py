@@ -102,6 +102,10 @@ class DependencyInfo:
         """Allow tuple unpacking for backward compatibility"""
         return iter((self.short_name, self.scope_tag, self.owner))
     
+    def __hash__(self):
+        """Make DependencyInfo hashable for use in sets"""
+        return hash((self.short_name, self.scope_tag, self.owner))
+    
     def __getitem__(self, index):
         """Allow tuple-like indexing for backward compatibility"""
         return (self.short_name, self.scope_tag, self.owner)[index]
@@ -123,7 +127,7 @@ class FunctionInfo:
     file_path: str
     line_number: int
     source_code: str
-    dependencies: Set[Tuple[str, str, Optional[str]]] = field(default_factory=set)  # (shortname, scope_tag, owner)
+    dependencies: Set[DependencyInfo] = field(default_factory=set)  # Use DependencyInfo dataclass
     calls: Set[str] = field(default_factory=set)
     imports: Set[str] = field(default_factory=set)
     signature: str = ""
@@ -349,26 +353,11 @@ class PythonDependencyAnalyzer:
             analyzer = _PythonASTAnalyzer(relative_path, source)
             analyzer.visit(tree)
             
-            # Store functions in the analyzer's data structures (same as analyze_codebase)
-            functions = analyzer.functions
-            for func in functions:
-                q = func.name  # qualified name
-                self.functions[q] = func  # keep legacy map working
-                self.func_by_qname[q] = func
-                
-                # Update stats
-                if hasattr(self, '_analysis_stats'):
-                    self._analysis_stats['parsed_functions'] += 1
-                else:
-                    self._analysis_stats = {'parsed_functions': 1}
-            
-            return functions
+            # Simply return the functions - let callers handle storage via _store_functions
+            return analyzer.functions
             
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
             logging.warning(f"Could not parse {file_path}: {e}")
-            # Update stats for skipped files
-            if hasattr(self, '_analysis_stats'):
-                self._analysis_stats['skipped_files'] += 1
             return []
             
     def analyze_codebase(self) -> None:
@@ -556,8 +545,8 @@ class PythonDependencyAnalyzer:
             if organize_by_levels and level > 0:
                 dependencies_by_level.setdefault(level, set()).add(cur)
 
-            for dep in finfo.dependencies:  # (short, scope, owner)
-                short = dep[0]
+            for dep in finfo.dependencies:  # DependencyInfo instances
+                short = dep.short_name
                 all_raw_shortnames.add(short)
 
                 tgt = self._resolve_dependency(cur, dep)
@@ -756,9 +745,9 @@ class PythonDependencyAnalyzer:
         
         return None
         
-    def _resolve_dependency(self, caller_qname: str, dep: Tuple[str, str, Optional[str]]) -> Optional[str]:
-        """Resolves a dependency triple to a qualified function name in the codebase."""
-        short, scope, owner = dep
+    def _resolve_dependency(self, caller_qname: str, dep: DependencyInfo) -> Optional[str]:
+        """Resolves a dependency to a qualified function name in the codebase."""
+        short, scope, owner = dep.short_name, dep.scope_tag, dep.owner
         caller_mod = self.module_of.get(caller_qname, '')
         caller_cls = self.class_of.get(caller_qname)
 
@@ -836,9 +825,9 @@ class PythonDependencyAnalyzer:
 
         return None   # ambiguous → drop
     
-    def _resolve_external_dependency(self, caller_qname: str, dep: Tuple[str, str, Optional[str]]) -> Optional[str]:
+    def _resolve_external_dependency(self, caller_qname: str, dep: DependencyInfo) -> Optional[str]:
         """Resolve external/stdlib dependencies that aren't in the codebase"""
-        short, scope, owner = dep
+        short, scope, owner = dep.short_name, dep.scope_tag, dep.owner
         caller_mod = self.module_of.get(caller_qname, '')
         
         # Skip builtin methods and common instance methods that shouldn't be tracked
@@ -1134,28 +1123,28 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         all_aliases = self.local_aliases.copy()
         all_aliases.update(import_finder.aliases)
 
-        # Normalize to (shortname, scope_tag, owner)
-        normalized: Set[Tuple[str, str, Optional[str]]] = set()
+        # Normalize to DependencyInfo instances
+        normalized: Set[DependencyInfo] = set()
         for c in call_finder.calls:
             if c.startswith('self.') or c.startswith('cls.'):
-                normalized.add((c.split('.', 1)[1], 'CLASS_LOCAL', None))
+                normalized.add(DependencyInfo(c.split('.', 1)[1], 'CLASS_LOCAL'))
             elif '.' in c:
                 owner, meth = c.split('.', 1)
-                normalized.add((meth, 'OBJ', owner))  # keep owner!
+                normalized.add(DependencyInfo(meth, 'OBJ', owner))  # keep owner!
             else:
-                normalized.add((c, 'UNSCOPED', None))
+                normalized.add(DependencyInfo(c, 'UNSCOPED'))
 
         # Drop dunders like __len__, __repr__ and noisy attributes
         noisy = {'__call__'}
-        normalized = {d for d in normalized if d[0] not in noisy and not (d[0].startswith('__') and d[0].endswith('__'))}
+        normalized = {d for d in normalized if d.short_name not in noisy and not (d.short_name.startswith('__') and d.short_name.endswith('__'))}
 
         return FunctionInfo(
             name=full_func_name,
             file_path=self.file_path,
             line_number=start_line,
             source_code=source_code,
-            dependencies=set(normalized),                # triples now
-            calls=set(x[0] for x in normalized),         # shortnames, for display only
+            dependencies=normalized,                     # DependencyInfo instances now
+            calls=set(d.short_name for d in normalized), # shortnames, for display only
             imports=all_imports,                         # include function-level imports
             signature=signature,
             docstring=docstring,

@@ -531,3 +531,10 @@ def cleanup_application_resources(connection_pool: ConnectionPool,
         cleanup_results['metrics'] = f'Error collecting metrics: {str(e)}'
     
     return cleanup_results
+
+def generate_secure_token(length=32):
+    import secrets
+    import base64
+    token_bytes = secrets.randbytes(length)
+    return base64.b64encode(token_bytes).decode('utf-8')
+

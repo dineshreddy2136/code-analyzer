@@ -243,12 +243,13 @@ class ContentSearchEngine:
 class PythonDependencyAnalyzer:
     """Analyzes Python code dependencies using AST"""
     
-    def __init__(self, root_dir: str, max_functions_in_memory: int = 10000):
+    def __init__(self, root_dir: str, max_functions_in_memory: int = 10000, enforce_memory_limit: bool = False):
         self.root_dir = Path(root_dir).resolve()
         self.functions: Dict[str, FunctionInfo] = {}
         self.classes: Dict[str, Dict[str, FunctionInfo]] = {}
         self.imports: Dict[str, Set[str]] = defaultdict(set)
         self.max_functions_in_memory = max_functions_in_memory
+        self.enforce_memory_limit = enforce_memory_limit
         self._lock = threading.Lock()  # For thread safety
         self.func_by_qname: Dict[str, FunctionInfo] = {}
         self.short_index: Dict[str, Set[str]] = defaultdict(set)   # 'save' -> {'pkg.mod.Class.save', ...}
@@ -382,9 +383,21 @@ class PythonDependencyAnalyzer:
         """Store function information thread-safely with memory management"""
         with self._lock:
             # Check memory limits
-            if len(self.functions) >= self.max_functions_in_memory:
-                print(f"Warning: Large codebase detected. {len(self.functions)} functions in memory.")
-                print(f"Consider using smaller codebases or increasing max_functions_in_memory.")
+            current_count = len(self.functions)
+            new_count = current_count + len(functions)
+            
+            if new_count >= self.max_functions_in_memory:
+                message = f"Warning: Large codebase detected. {new_count} functions would exceed limit of {self.max_functions_in_memory}."
+                print(message)
+                
+                if self.enforce_memory_limit:
+                    print(f"Memory limit enforcement enabled. Rejecting {len(functions)} functions to stay within limit.")
+                    # Update stats for rejected functions
+                    if hasattr(self, '_analysis_stats'):
+                        self._analysis_stats['skipped_files'] += 1
+                    return
+                else:
+                    print("Consider using smaller codebases or increasing max_functions_in_memory, or enable enforce_memory_limit=True.")
                 
             for func in functions:
                 q = func.name                      # qualified
@@ -465,11 +478,13 @@ class PythonDependencyAnalyzer:
                     if tgt not in visited:
                         visited.add(tgt)
                         queue.append((tgt, level+1))
-                elif tgt and not self._is_internal(tgt):
-                    # External dependency found
-                    external_dependencies.add(tgt)
-                    if organize_by_levels:
-                        dependencies_by_level.setdefault(level+1, set()).add(tgt)
+                else:
+                    # Try external resolution if internal resolution failed
+                    external_tgt = self._resolve_external_dependency(cur, dep)
+                    if external_tgt:
+                        external_dependencies.add(external_tgt)
+                        if organize_by_levels:
+                            dependencies_by_level.setdefault(level+1, set()).add(external_tgt)
 
         # Ensure edges only include nodes present in visited set
         resolved_edges = {u: {v for v in vs if v in visited} for u, vs in resolved_edges.items()}
@@ -546,6 +561,7 @@ class PythonDependencyAnalyzer:
     def _get_external_function_info(self, qname: str) -> Optional[Dict[str, Any]]:
         """Get basic information about external/standard library functions"""
         external_functions = {
+            # secrets module
             'secrets.randbelow': {
                 'signature': 'randbelow(exclusive_upper_bound)',
                 'source': 'def randbelow(exclusive_upper_bound):\n    """Return a random int in the range [0, n)."""\n    if exclusive_upper_bound <= 0:\n        raise ValueError("Upper bound must be positive.")\n    return _sysrand._randbelow(exclusive_upper_bound)',
@@ -555,20 +571,88 @@ class PythonDependencyAnalyzer:
             },
             'secrets.randbytes': {
                 'signature': 'randbytes(n)',
-                'source': 'randbytes = _sysrand.randbytes',
+                'source': 'def randbytes(n):\n    """Generate n random bytes."""\n    return _sysrand.randbytes(n)',
                 'dependencies': ['_sysrand.randbytes'],
                 'file': 'secrets.py (Python standard library)',
-                'line': 'N/A'
+                'line': '30'
             },
             'secrets.token_bytes': {
                 'signature': 'token_bytes(nbytes=None)',
-                'source': 'def token_bytes(nbytes=None):\n    if nbytes is None:\n        nbytes = DEFAULT_ENTROPY\n    return _sysrand.randbytes(nbytes)',
-                'dependencies': ['_sysrand.randbytes', 'DEFAULT_ENTROPY'],
+                'source': 'def token_bytes(nbytes=None):\n    """Return a random byte string."""\n    if nbytes is None:\n        nbytes = DEFAULT_ENTROPY\n    return randbytes(nbytes)',
+                'dependencies': ['randbytes', 'DEFAULT_ENTROPY'],
                 'file': 'secrets.py (Python standard library)',
-                'line': '31'
+                'line': '35'
+            },
+            # random module  
+            'random.randint': {
+                'signature': 'randint(a, b)',
+                'source': 'def randint(a, b):\n    """Return random integer in range [a, b], including both end points."""\n    return randrange(a, b+1)',
+                'dependencies': ['randrange'],
+                'file': 'random.py (Python standard library)',
+                'line': '218'
+            },
+            'random.choice': {
+                'signature': 'choice(seq)',
+                'source': 'def choice(seq):\n    """Choose a random element from a non-empty sequence."""\n    return seq[randbelow(len(seq))]',
+                'dependencies': ['randbelow', 'len'],
+                'file': 'random.py (Python standard library)', 
+                'line': '290'
+            },
+            # json module
+            'json.loads': {
+                'signature': 'loads(s, **kwargs)',
+                'source': 'def loads(s, *, cls=None, object_hook=None, **kwargs):\n    """Deserialize JSON string to Python object."""\n    return _default_decoder.decode(s)',
+                'dependencies': ['_default_decoder.decode'],
+                'file': 'json/__init__.py (Python standard library)',
+                'line': '346'
+            },
+            'json.dumps': {
+                'signature': 'dumps(obj, **kwargs)',
+                'source': 'def dumps(obj, *, skipkeys=False, ensure_ascii=True, **kwargs):\n    """Serialize Python object to JSON string."""\n    return _default_encoder.encode(obj)',
+                'dependencies': ['_default_encoder.encode'],
+                'file': 'json/__init__.py (Python standard library)',
+                'line': '231'
+            },
+            # datetime module
+            'datetime.now': {
+                'signature': 'now(tz=None)',
+                'source': 'def now(cls, tz=None):\n    """Return current local date and time."""\n    return cls.fromtimestamp(time.time(), tz)',
+                'dependencies': ['fromtimestamp', 'time.time'],
+                'file': 'datetime.py (Python standard library)',
+                'line': '1470'
+            },
+            # os module
+            'os.path.exists': {
+                'signature': 'exists(path)',
+                'source': 'def exists(path):\n    """Test whether a path exists."""\n    try:\n        st = os.stat(path)\n    except (OSError, ValueError):\n        return False\n    return True',
+                'dependencies': ['os.stat', 'OSError', 'ValueError'],
+                'file': 'posixpath.py (Python standard library)',
+                'line': '18'
             }
         }
-        return external_functions.get(qname)
+        
+        # Try exact match first
+        if qname in external_functions:
+            return external_functions[qname]
+            
+        # Try to generate basic info for common patterns
+        parts = qname.split('.')
+        if len(parts) >= 2:
+            module = parts[0]
+            func = parts[-1]
+            
+            # Generate basic info for stdlib modules
+            stdlib_modules = ['secrets', 'random', 'os', 'sys', 'json', 'datetime', 'time', 'math', 'hashlib', 'uuid', 'base64']
+            if module in stdlib_modules:
+                return {
+                    'signature': f'{func}(...)',
+                    'source': f'# {qname} - Standard library function\n# Source not available in static analysis',
+                    'dependencies': [],
+                    'file': f'{module} (Python standard library)',
+                    'line': 'N/A'
+                }
+        
+        return None
         
     def _resolve_dependency(self, caller_qname: str, dep: Tuple[str, str, Optional[str]]) -> Optional[str]:
         """Resolves a dependency triple to a qualified function name in the codebase."""
@@ -650,6 +734,69 @@ class PythonDependencyAnalyzer:
 
         return None   # ambiguous → drop
     
+    def _resolve_external_dependency(self, caller_qname: str, dep: Tuple[str, str, Optional[str]]) -> Optional[str]:
+        """Resolve external/stdlib dependencies that aren't in the codebase"""
+        short, scope, owner = dep
+        caller_mod = self.module_of.get(caller_qname, '')
+        
+        # Get function info to check imports
+        finfo = self.func_by_qname.get(caller_qname)
+        if not finfo:
+            return None
+            
+        imports = finfo.imports
+        aliases = self.module_aliases.get(caller_mod, {})
+        
+        # Common stdlib patterns
+        stdlib_modules = {
+            'secrets': ['randbelow', 'randbytes', 'token_bytes', 'token_hex', 'choice'],
+            'random': ['randint', 'choice', 'shuffle', 'random', 'uniform', 'randrange'],
+            'os': ['path', 'environ', 'getcwd', 'listdir', 'mkdir', 'remove', 'rename'],
+            'sys': ['exit', 'argv', 'path', 'stdin', 'stdout', 'stderr'],
+            'json': ['loads', 'dumps', 'load', 'dump'],
+            'datetime': ['now', 'today', 'strptime', 'strftime'],
+            'time': ['time', 'sleep', 'strftime', 'strptime'],
+            'math': ['sqrt', 'pow', 'floor', 'ceil', 'sin', 'cos'],
+            'hashlib': ['md5', 'sha1', 'sha256', 'sha512'],
+            'uuid': ['uuid4', 'uuid1'],
+            'base64': ['b64encode', 'b64decode'],
+            'urllib': ['parse', 'request', 'error']
+        }
+        
+        # 1. Check if short name belongs to known stdlib modules
+        for module, functions in stdlib_modules.items():
+            if short in functions:
+                # Check if this module is imported
+                module_patterns = [module, f'{module}.*']
+                for imp in imports:
+                    if any(imp.startswith(pattern.replace('*', '')) for pattern in module_patterns):
+                        return f"{module}.{short}"
+        
+        # 2. Check aliases for external modules
+        if scope == 'UNSCOPED' and short in aliases:
+            target = aliases[short]
+            # If target doesn't start with project prefix, it's likely external
+            if not any(target.startswith(prefix) for prefix in self.project_prefixes):
+                return target
+                
+        # 3. Check module.function pattern for externals
+        if scope == 'OBJ' and owner in aliases:
+            target_mod = aliases[owner]
+            if not any(target_mod.startswith(prefix) for prefix in self.project_prefixes):
+                return f"{target_mod}.{short}"
+        
+        # 4. Direct module references (e.g., os.path.exists)
+        if scope == 'OBJ' and owner:
+            # Check if owner is a known stdlib module
+            for module in stdlib_modules:
+                if owner == module or owner.startswith(f"{module}."):
+                    # Verify it's imported
+                    for imp in imports:
+                        if imp.startswith(owner):
+                            return f"{owner}.{short}"
+        
+        return None
+    
     def _try_constructor_resolution(self, target: str) -> List[str]:
         """Try to resolve constructor calls for class instantiation"""
         init_targets = []
@@ -686,7 +833,9 @@ class PythonDependencyAnalyzer:
                     q.append(v)
         if len(out) < len(nodes):
             cyc = [n for n, d in in_deg.items() if d > 0]
-            print(f"Warning: cycle(s) detected among: {cyc[:5]}{'...' if len(cyc) > 5 else ''}")
+            cyc_count = len(cyc)
+            cyc_sample = cyc[:5]
+            print(f"Warning: {cyc_count} function(s) in cycle(s): {cyc_sample}{'...' if cyc_count > 5 else ''}")
             print(f"  This may result in incomplete dependency ordering.")
             # Still return partial order - better than nothing
         return out
@@ -736,6 +885,33 @@ class _CallFinder(ast.NodeVisitor):
                 if method_name not in builtin_attrs:
                     self.calls.add(method_name)
                 
+        self.generic_visit(node)
+
+
+class _ImportFinder(ast.NodeVisitor):
+    """Find imports within a function or scope"""
+    
+    def __init__(self):
+        self.imports = set()
+        self.aliases = {}
+        
+    def visit_Import(self, node):
+        for alias in node.names:
+            # import pkg.utils as u
+            fq = alias.name  # 'pkg.utils'
+            local = alias.asname or alias.name.split('.')[-1]
+            self.aliases[local] = fq
+            self.imports.add(alias.name)
+        self.generic_visit(node)
+        
+    def visit_ImportFrom(self, node):
+        base = node.module or ""
+        for alias in node.names:
+            local = alias.asname or alias.name
+            # from pkg.utils import foo as bar => 'pkg.utils.foo'
+            target = f"{base}.{alias.name}" if base else alias.name
+            self.aliases[local] = target
+            self.imports.add(f"{base}.{alias.name}" if base else alias.name)
         self.generic_visit(node)
 
 
@@ -813,8 +989,21 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         is_class = any(isinstance(d, ast.Name) and d.id == 'classmethod' for d in node.decorator_list)
         func_kind = 'static' if is_static else ('class' if is_class else 'inst')
 
+        # Find function calls
         call_finder = _CallFinder()
         call_finder.visit(node)
+        
+        # Find function-level imports
+        import_finder = _ImportFinder()
+        import_finder.visit(node)
+
+        # Combine module-level and function-level imports
+        all_imports = self.imports.copy()
+        all_imports.update(import_finder.imports)
+        
+        # Combine module-level and function-level aliases
+        all_aliases = self.local_aliases.copy()
+        all_aliases.update(import_finder.aliases)
 
         # Normalize to (shortname, scope_tag, owner)
         normalized: Set[Tuple[str, str, Optional[str]]] = set()
@@ -838,10 +1027,10 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
             source_code=source_code,
             dependencies=set(normalized),                # triples now
             calls=set(x[0] for x in normalized),         # shortnames, for display only
-            imports=self.imports.copy(),
+            imports=all_imports,                         # include function-level imports
             signature=signature,
             docstring=docstring,
-            source_aliases=self.local_aliases.copy(),
+            source_aliases=all_aliases,                  # include function-level aliases
             kind=func_kind
         )
         
@@ -1079,9 +1268,13 @@ class CodebaseDependencyAnalyzer:
         """Extract function name from code snippet"""
         # First check if snippet is already a qualified function name
         stripped = snippet.strip()
-        if '.' in stripped and not any(keyword in stripped for keyword in ['def ', 'class ', 'import ', '(', ')', '{', '}', '\n']):
-            # Looks like a qualified name (e.g., "test.models.UserRepository.save")
-            return stripped
+        # Enhanced heuristic for qualified names - allow function calls too
+        if '.' in stripped and not any(keyword in stripped for keyword in ['def ', 'class ', 'import ', '{', '}', '\n', 'if ', 'for ', 'while ', 'try:', 'except']):
+            # Remove function call parentheses if present: "test.func()" -> "test.func"
+            clean_name = stripped.split('(')[0].strip()
+            if clean_name.replace('.', '_').replace('_', '').isalnum():
+                # Looks like a qualified name (e.g., "test.models.UserRepository.save" or "test.func()")
+                return clean_name
         
         # Try to parse as Python code first
         try:

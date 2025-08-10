@@ -631,11 +631,12 @@ class PythonDependencyAnalyzer:
 
         # Ensure edges only include nodes present in visited set
         resolved_edges = {u: {v for v in vs if v in visited} for u, vs in resolved_edges.items()}
-        ordered = self._topological_sort_resolved(visited, resolved_edges)
+        ordered, cycle_nodes = self._topological_sort_resolved(visited, resolved_edges)
         if ordered and ordered[0] == start:
             ordered = ordered[1:]
         ordered.reverse()  # put callees before callers
 
+        # Never claim an order for cyclic nodes; surface them separately
         final_order = ordered + sorted(external_dependencies)
         return {
             'start_node': start,
@@ -645,7 +646,9 @@ class PythonDependencyAnalyzer:
             'external_dependencies': sorted(external_dependencies),
             'dependencies_by_level': {int(k): sorted(v) for k, v in (dependencies_by_level or {}).items()} if organize_by_levels else None,
             'edges': {k: sorted(v) for k, v in resolved_edges.items()},
-            'external_edges': {k: sorted(v) for k, v in external_edges.items()}
+            'external_edges': {k: sorted(v) for k, v in external_edges.items()},
+            'has_cycles': bool(cycle_nodes),
+            'cycle_nodes': cycle_nodes
         }
 
     def _get_nested_dependency_levels(self, function_name: str, _: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
@@ -818,6 +821,9 @@ class PythonDependencyAnalyzer:
         caller_mod = self.module_of.get(caller_qname, '')
         caller_cls = self.class_of.get(caller_qname)
         aliases = self.module_aliases.get(caller_mod, {})
+        finfo = self.func_by_qname.get(caller_qname)
+        imports = finfo.imports if finfo else set()
+        instance_map = finfo.instance_map if finfo else {}
 
         # 1) same class (for self./cls.)
         if scope == 'CLASS_LOCAL' and caller_cls:
@@ -895,11 +901,34 @@ class PythonDependencyAnalyzer:
                         parts = resolved_func.split('.')
                         if len(parts) >= 2 and any(owner.lower() in part.lower() for part in parts[:-1]):
                             return resolved_func
+                    # NEW: if we know the owner's instance type, require a hint match
+                    hint = instance_map.get(owner)
+                    if hint:
+                        # take last one or two identifiers as a loose "type" hint
+                        hint_parts = re.split(r'[._]', hint)
+                        hint_tail = [h.lower() for h in hint_parts[-2:]] if len(hint_parts) >= 2 else [hint_parts[-1].lower()]
+                        rf_lower = resolved_func.lower()
+                        if any(h in rf_lower for h in hint_tail):
+                            return resolved_func
                 # For unrecognized object method calls, don't guess
                 return None
             else:
-                # For UNSCOPED and CLASS_LOCAL calls, the old logic is fine
-                return next(iter(bucket))
+                # For UNSCOPED fallback, require that the target module is the caller's module
+                # OR explicitly imported in this file/scope. This prevents cross-repo lucky matches.
+                resolved_func = next(iter(bucket))
+                if scope == 'UNSCOPED':
+                    target_mod = self.module_of.get(resolved_func, '')
+                    top_target = target_mod.split('.', 1)[0] if target_mod else ''
+                    imported = (
+                        target_mod in imports or
+                        any(imp == target_mod or imp.startswith(target_mod + '.') for imp in imports) or
+                        any(imp == top_target or imp.startswith(top_target + '.') for imp in imports)
+                    )
+                    if target_mod == caller_mod or imported:
+                        return resolved_func
+                    return None
+                # CLASS_LOCAL with unique short-name isn't expected here, but keep legacy behavior:
+                return resolved_func
 
         # 6) Try constructor for class instantiation (e.g., UserService() -> UserService.__init__)
         # Handle both aliased and direct class calls
@@ -1057,8 +1086,10 @@ class PythonDependencyAnalyzer:
                 
         return True
         
-    def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> List[str]:
-        """Sort functions in dependency order using resolved edges"""
+    def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> Tuple[List[str], List[str]]:
+        """Sort functions in dependency order using resolved edges.
+        Returns (ordered_nodes, cyclic_nodes). The cyclic_nodes are any nodes that
+        could not be ordered due to one or more cycles."""
         # Use sorted lists everywhere for deterministic output
         nodes_sorted = sorted(nodes)
         edges_sorted = {u: set(sorted(vs)) for u, vs in edges.items()}
@@ -1085,11 +1116,12 @@ class PythonDependencyAnalyzer:
                         idx += 1
                     q.insert(idx, v)
 
+        cyclic_nodes = []
         if len(out) < len(nodes_sorted):
-            cyc = [n for n, d in in_deg.items() if d > 0]
-            logging.warning(f"{len(cyc)} function(s) in cycle(s): {cyc[:5]}{'...' if len(cyc)>5 else ''}")
-            logging.warning("  This may result in incomplete dependency ordering.")
-        return out
+            cyclic_nodes = sorted([n for n, d in in_deg.items() if d > 0])
+            logging.warning(f"{len(cyclic_nodes)} function(s) in cycle(s): {cyclic_nodes[:5]}{'...' if len(cyclic_nodes)>5 else ''}")
+            logging.warning("  Nodes in cycles are reported separately and omitted from the ordered list.")
+        return out, cyclic_nodes
 
 
 class _CallFinder(ast.NodeVisitor):
@@ -1933,6 +1965,7 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     dependencies_by_level = deps.get('dependencies_by_level', {})
     user_defined_deps = deps.get('user_defined_order', [])
     external_deps = deps.get('external_dependencies', [])
+    cycle_nodes = deps.get('cycle_nodes', [])
     
     if dependencies_by_level:
         output.append("Dependencies by Level:")
@@ -1965,6 +1998,13 @@ def _format_text_output(result: Dict[str, Any]) -> str:
         
         for i, dep_name in enumerate(all_deps, 1):
             output.append(f"{i}. {dep_name}")
+        output.append("")
+
+    if cycle_nodes:
+        output.append("Cyclical dependencies detected (unordered):")
+        output.append("-" * 40)
+        for n in cycle_nodes:
+            output.append(f"  - {n}")
         output.append("")
 
     # Show all detected calls if available

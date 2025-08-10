@@ -11,7 +11,7 @@ Features:
 - Content search with regex support  
 - Python function dependency analysis
 - Dependency resolution and ordering
-- Caching for improved performance
+- File listing cache for improved performance
 
 Usage:
     python codebase_dependency_analyzer.py <codebase.zip> <function_snippet.txt>
@@ -588,6 +588,7 @@ class PythonDependencyAnalyzer:
                 }
 
         resolved_edges: Dict[str, Set[str]] = defaultdict(set)
+        external_edges: Dict[str, Set[str]] = defaultdict(set)
         visited = {start}
         queue = deque([(start, 0)])  # Use deque for O(1) operations
         all_raw_shortnames = set()
@@ -618,6 +619,7 @@ class PythonDependencyAnalyzer:
                     external_tgt = self._resolve_external_dependency(cur, dep)
                     if external_tgt:
                         external_dependencies.add(external_tgt)
+                        external_edges[cur].add(external_tgt)
                         if organize_by_levels:
                             dependencies_by_level.setdefault(level+1, set()).add(external_tgt)
 
@@ -626,6 +628,7 @@ class PythonDependencyAnalyzer:
         ordered = self._topological_sort_resolved(visited, resolved_edges)
         if ordered and ordered[0] == start:
             ordered = ordered[1:]
+        ordered.reverse()  # put callees before callers
 
         final_order = ordered + sorted(external_dependencies)
         return {
@@ -635,7 +638,8 @@ class PythonDependencyAnalyzer:
             'total_calls': len(all_raw_shortnames),
             'external_dependencies': sorted(external_dependencies),
             'dependencies_by_level': {int(k): sorted(v) for k, v in (dependencies_by_level or {}).items()} if organize_by_levels else None,
-            'edges': {k: sorted(v) for k, v in resolved_edges.items()}
+            'edges': {k: sorted(v) for k, v in resolved_edges.items()},
+            'external_edges': {k: sorted(v) for k, v in external_edges.items()}
         }
 
     def _get_nested_dependency_levels(self, function_name: str, _: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
@@ -1680,15 +1684,22 @@ class AnalysisRunner:
         return dependencies_result
 
 
-def emit_dot(edges: Dict[str, Set[str]], start: str) -> str:
+def emit_dot(edges: Dict[str, Set[str]], start: str, external_edges: Dict[str, Set[str]] = None) -> str:
     """Emit dependencies as Graphviz DOT format"""
     lines = ["digraph deps {"]
     lines.append('  node [shape=box];')
+    lines.append('  rankdir=LR;')
     lines.append(f'  "{start}" [style=filled,fillcolor=lightblue];')
     
     for u, vs in sorted(edges.items()):
         for v in sorted(vs):
             lines.append(f'  "{u}" -> "{v}";')
+    
+    if external_edges:
+        for u, vs in sorted(external_edges.items()):
+            for v in sorted(vs):
+                lines.append(f'  "{u}" -> "{v}" [style=dashed];')
+    
     lines.append("}")
     return "\n".join(lines)
 
@@ -1780,7 +1791,8 @@ Examples:
         else:
             start_node = deps.get('start_node', 'unknown')
             edges = deps.get('edges', {})
-            output = emit_dot(edges, start_node)
+            external_edges = deps.get('external_edges', {})
+            output = emit_dot(edges, start_node, external_edges)
     elif args.emit == 'text':
         output = _format_text_output(result)
     else:

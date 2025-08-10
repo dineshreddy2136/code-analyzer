@@ -307,8 +307,6 @@ class PythonDependencyAnalyzer:
     def __init__(self, root_dir: str, max_functions_in_memory: int = DEFAULT_MAX_FUNCTIONS, enforce_memory_limit: bool = False):
         self.root_dir = Path(root_dir).resolve()
         self.functions: Dict[str, FunctionInfo] = {}
-        self.classes: Dict[str, Dict[str, FunctionInfo]] = {}
-        self.imports: Dict[str, Set[str]] = defaultdict(set)
         self.max_functions_in_memory = max_functions_in_memory
         self.enforce_memory_limit = enforce_memory_limit
         self._lock = threading.Lock()  # For thread safety
@@ -1032,6 +1030,7 @@ class _ImportFinder(ast.NodeVisitor):
     def __init__(self):
         self.imports = set()
         self.aliases = {}
+        self.file_path = None  # Set by caller for logging
         
     def visit_Import(self, node):
         for alias in node.names:
@@ -1067,32 +1066,14 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         self.source_lines = source.splitlines()
         self.functions: List[FunctionInfo] = []
         self.current_class = None
-        self.imports = set()
-        self.local_aliases: Dict[str, str] = {}  # local_name -> fully_qualified_target
         
-    def visit_Import(self, node):
-        for alias in node.names:
-            # import pkg.utils as u
-            fq = alias.name  # 'pkg.utils'
-            local = alias.asname or alias.name.split('.')[-1]
-            self.local_aliases[local] = fq
-            self.imports.add(alias.name)
-        self.generic_visit(node)
-        
-    def visit_ImportFrom(self, node):
-        base = node.module or ""
-        for alias in node.names:
-            if alias.name == '*':
-                logging.warning(f"Wildcard import `from {base} import *` detected in {self.file_path}. "
-                              f"Dependency resolution may be incomplete.")
-                continue  # Skip processing the '*'
-            
-            local = alias.asname or alias.name
-            # from pkg.utils import foo as bar => 'pkg.utils.foo'
-            target = f"{base}.{alias.name}" if base else alias.name
-            self.local_aliases[local] = target
-            self.imports.add(f"{base}.{alias.name}" if base else alias.name)
-        self.generic_visit(node)
+        # Use _ImportFinder to handle all module-level imports
+        import_finder = _ImportFinder()
+        import_finder.file_path = file_path  # Add file_path for logging
+        tree = ast.parse(source)
+        import_finder.visit(tree)
+        self.imports = import_finder.imports
+        self.local_aliases = import_finder.aliases
         
     def visit_FunctionDef(self, node):
         func_info = self._extract_function_info(node)
@@ -1315,22 +1296,6 @@ class AnalysisRunner:
             # Clean up
             if not keep:
                 self.extractor.cleanup()
-            
-    def _detect_codebase_language(self) -> str:
-        """Detect the primary language of the codebase - focuses on Python"""
-        python_files = 0
-        
-        for root, _, files in os.walk(self.extracted_dir):
-            for file in files:
-                if file.endswith('.py'):
-                    python_files += 1
-                    
-        if python_files > 0:
-            print(f"Detected Python codebase with {python_files} Python files")
-            return 'python'
-        else:
-            print("No Python files detected in codebase")
-            return 'unknown'
             
     def _find_function_in_codebase(self, function_snippet: str) -> Optional[Dict[str, Any]]:
         """Find the function in the extracted codebase"""

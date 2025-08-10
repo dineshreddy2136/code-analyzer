@@ -1,11 +1,43 @@
-def cleanup_application_resources(connection_pool: ConnectionPool, 
-                                cache_manager: CacheManager,
-                                metrics_collector: MetricsCollector) -> Dict[str, Any]:
-    """Cleanup application resources"""
-    cleanup_results = {}
+def import_(self) -> Response:
+        """Import themes from a ZIP file.
+        ---
+        post:
+          summary: Import themes from a ZIP file
+          requestBody:
+            required: true
+            content:
+              multipart/form-data:
+                schema:
+                  type: object
+                  properties:
+                    formData:
+                      type: string
+                      format: binary
+                    overwrite:
+                      type: string
+          responses:
+            200:
+              description: Theme imported
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        upload = request.files.get("formData")
+        if not upload:
+            return self.response_400()
+        if not isinstance(upload, FileStorage):
+            return self.response_400()
+
     
-    # Cleanup database connections
-    try:
-        stale_connections = connection_pool.cleanup_stale_connections(timeout_minutes=30)
-        cleanup_results['database'] = f'Cleaned up {stale_connections} stale connections'
-    except Exception as e:

@@ -321,24 +321,50 @@ class PythonDependencyAnalyzer:
         
     def analyze_file(self, file_path: str) -> List[FunctionInfo]:
         """Analyze a Python file and extract function information"""
-        full_path = self.root_dir / file_path
+        file_path_obj = Path(file_path)
+        
+        # Handle both absolute and relative paths
+        if file_path_obj.is_absolute():
+            full_path = file_path_obj
+            # Calculate relative path from root_dir for module naming
+            try:
+                relative_path = str(full_path.relative_to(self.root_dir))
+            except ValueError:
+                # If file is not under root_dir, use the filename
+                relative_path = full_path.name
+        else:
+            full_path = self.root_dir / file_path
+            relative_path = file_path
         
         try:
             # Check file size to avoid loading extremely large files
             file_stats = full_path.stat()
             max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
             if file_stats.st_size > max_file_size:
-                logging.warning(f"Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
+                logging.warning(f"Skipping large file {relative_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
                 return []
                 
             with open(full_path, 'r', encoding='utf-8') as f:
                 source = f.read()
                 
             tree = ast.parse(source)
-            analyzer = _PythonASTAnalyzer(file_path, source)
+            analyzer = _PythonASTAnalyzer(relative_path, source)
             analyzer.visit(tree)
             
-            return analyzer.functions
+            # Store functions in the analyzer's data structures (same as analyze_codebase)
+            functions = analyzer.functions
+            for func in functions:
+                q = func.name  # qualified name
+                self.functions[q] = func  # keep legacy map working
+                self.func_by_qname[q] = func
+                
+                # Update stats
+                if hasattr(self, '_analysis_stats'):
+                    self._analysis_stats['parsed_functions'] += 1
+                else:
+                    self._analysis_stats = {'parsed_functions': 1}
+            
+            return functions
             
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
             logging.warning(f"Could not parse {file_path}: {e}")
@@ -883,8 +909,10 @@ class PythonDependencyAnalyzer:
                         potential_qname = f"{imp}.{owner}.{short}"  # e.g., "os.path.exists"
                         
                         # Check if this reconstructed name is a known external function
-                        if (potential_qname in STDLIB_SUBMODULES or 
-                            any(potential_qname.startswith(f"{mod}.") for mod in stdlib_modules)):
+                        # BUT only if the owner looks like a known submodule, not a variable name
+                        if (owner in ['path', 'environ', 'urlencode', 'parse', 'request', 'error', 'response'] and
+                            (potential_qname in STDLIB_SUBMODULES or 
+                             any(potential_qname.startswith(f"{mod}.") for mod in stdlib_modules))):
                             return potential_qname
             
             # Check for complex stdlib paths like urllib.parse.urlencode
@@ -1427,6 +1455,8 @@ class AnalysisRunner:
         """Analyze function dependencies"""
         # Only analyze Python codebases
         analyzer = PythonDependencyAnalyzer(self.extracted_dir)
+        
+        # Analyze entire codebase
         analyzer.analyze_codebase()
         
         function_name = function_info['function_name']

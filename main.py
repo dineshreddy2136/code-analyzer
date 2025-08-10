@@ -22,6 +22,7 @@ import sys
 import re
 import ast
 import json
+import logging
 import zipfile
 import hashlib
 import tempfile
@@ -245,10 +246,11 @@ class ContentSearchEngine:
                 file_stats = full_path.stat()
                 max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
                 if file_stats.st_size > max_file_size:
-                    print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB) in content search")
+                    logging.warning(f"Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB) in content search")
                     continue
                     
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    files_searched += 1
                     # Read line-by-line for better memory efficiency
                     for line_num, line in enumerate(f, 1):
                         if regex.search(line):
@@ -326,7 +328,7 @@ class PythonDependencyAnalyzer:
             file_stats = full_path.stat()
             max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
             if file_stats.st_size > max_file_size:
-                print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
+                logging.warning(f"Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
                 return []
                 
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -339,7 +341,7 @@ class PythonDependencyAnalyzer:
             return analyzer.functions
             
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-            print(f"Warning: Could not parse {file_path}: {e}")
+            logging.warning(f"Could not parse {file_path}: {e}")
             # Update stats for skipped files
             if hasattr(self, '_analysis_stats'):
                 self._analysis_stats['skipped_files'] += 1
@@ -355,7 +357,7 @@ class PythonDependencyAnalyzer:
                     rel_path = file_path.relative_to(self.root_dir)
                     python_files.append(str(rel_path))
                     
-        print(f"Analyzing {len(python_files)} Python files...")
+        logging.info(f"Analyzing {len(python_files)} Python files...")
         
         # Track analysis statistics
         self._analysis_stats = {
@@ -392,7 +394,7 @@ class PythonDependencyAnalyzer:
         
         # Print analysis summary
         analysis_time = time.time() - self._analysis_stats['analysis_start_time']
-        print(f"Analysis complete: {self._analysis_stats['parsed_functions']} functions parsed in {analysis_time:.2f}s")
+        logging.info(f"Analysis complete: {self._analysis_stats['parsed_functions']} functions parsed in {analysis_time:.2f}s")
         if self._analysis_stats['skipped_files'] > 0:
             print(f"Skipped {self._analysis_stats['skipped_files']} files due to size/parse errors")
         if self._analysis_stats.get('rejected_functions', 0) > 0:
@@ -438,7 +440,7 @@ class PythonDependencyAnalyzer:
                         print(f"Progress: {processed_files}/{total_files} files analyzed ({progress:.1f}%)")
                         
                 except Exception as e:
-                    print(f"Warning: Error processing {file_path}: {e}")
+                    logging.warning(f"Error processing {file_path}: {e}")
                     processed_files += 1
                     
     def _store_functions(self, functions: List[FunctionInfo]) -> None:
@@ -572,22 +574,31 @@ class PythonDependencyAnalyzer:
         
         # Get direct dependencies of this specific function
         direct_deps = self.func_by_qname[function_name].dependencies
-        resolved_once = []
-        for d in direct_deps:
-            r = self._resolve_dependency(function_name, d)
-            if r:
-                resolved_once.append(r)
-
-        user_defined_direct_deps = {r for r in resolved_once if r != function_name and r in self.func_by_qname}
+        resolved_internal = []
+        resolved_external = []
         
-        if not user_defined_direct_deps:
+        for d in direct_deps:
+            internal_r = self._resolve_dependency(function_name, d)
+            if internal_r:
+                resolved_internal.append(internal_r)
+            else:
+                external_r = self._resolve_external_dependency(function_name, d)
+                if external_r:
+                    resolved_external.append(external_r)
+
+        user_defined_direct_deps = {r for r in resolved_internal if r != function_name and r in self.func_by_qname}
+        external_direct_deps = set(resolved_external)
+        
+        if not user_defined_direct_deps and not external_direct_deps:
             return {}
         
         # Build nested levels by tracing this function's specific dependency chain
         nested_levels = {}
         
-        # Level 2: Direct dependencies of this function (user-defined only for first level)
-        nested_levels[2] = user_defined_direct_deps
+        # Level 2: Direct dependencies of this function (both internal and external)
+        level_2_deps = user_defined_direct_deps.union(external_direct_deps)
+        if level_2_deps:
+            nested_levels[2] = level_2_deps
         
         current_level_deps = user_defined_direct_deps
         visited_deps = set([function_name])  # Track visited to prevent cycles
@@ -806,6 +817,10 @@ class PythonDependencyAnalyzer:
         short, scope, owner = dep
         caller_mod = self.module_of.get(caller_qname, '')
         
+        # Skip builtin methods and common instance methods that shouldn't be tracked
+        if short in BUILTIN_METHODS or (scope == 'OBJ' and owner in ['self', 'cls']):
+            return None
+        
         # Get function info to check imports
         finfo = self.func_by_qname.get(caller_qname)
         if not finfo:
@@ -841,6 +856,12 @@ class PythonDependencyAnalyzer:
         
         # 4. Direct module references and complex paths (e.g., os.path.exists)
         if scope == 'OBJ' and owner:
+            # First, check if owner is a direct alias
+            if owner in aliases:
+                target_mod = aliases[owner]
+                if not any(target_mod.startswith(prefix) for prefix in self.project_prefixes):
+                    return f"{target_mod}.{short}"
+            
             # Check if owner is a known stdlib module or submodule
             for module in stdlib_modules:
                 if owner == module:
@@ -853,6 +874,18 @@ class PythonDependencyAnalyzer:
                     for imp in imports:
                         if imp.startswith(module):
                             return f"{owner}.{short}"
+            
+            # Only try to reconstruct for known stdlib patterns, not builtin methods
+            if owner not in ['self', 'cls'] and short not in BUILTIN_METHODS:
+                for imp in imports:  # e.g., imp = 'os'
+                    # Only for known stdlib modules
+                    if imp in stdlib_modules:
+                        potential_qname = f"{imp}.{owner}.{short}"  # e.g., "os.path.exists"
+                        
+                        # Check if this reconstructed name is a known external function
+                        if (potential_qname in STDLIB_SUBMODULES or 
+                            any(potential_qname.startswith(f"{mod}.") for mod in stdlib_modules)):
+                            return potential_qname
             
             # Check for complex stdlib paths like urllib.parse.urlencode
             stdlib_submodules = STDLIB_SUBMODULES
@@ -905,7 +938,7 @@ class PythonDependencyAnalyzer:
             cyc = [n for n, d in in_deg.items() if d > 0]
             cyc_count = len(cyc)
             cyc_sample = cyc[:5]
-            print(f"Warning: {cyc_count} function(s) in cycle(s): {cyc_sample}{'...' if cyc_count > 5 else ''}")
+            logging.warning(f"{cyc_count} function(s) in cycle(s): {cyc_sample}{'...' if cyc_count > 5 else ''}")
             print(f"  This may result in incomplete dependency ordering.")
             # Still return partial order - better than nothing
         return out
@@ -984,6 +1017,11 @@ class _ImportFinder(ast.NodeVisitor):
     def visit_ImportFrom(self, node):
         base = node.module or ""
         for alias in node.names:
+            if alias.name == '*':
+                logging.warning(f"Wildcard import `from {base} import *` detected in {self.file_path}. "
+                              f"Dependency resolution may be incomplete.")
+                continue  # Skip processing the '*'
+            
             local = alias.asname or alias.name
             # from pkg.utils import foo as bar => 'pkg.utils.foo'
             target = f"{base}.{alias.name}" if base else alias.name
@@ -1016,6 +1054,11 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
     def visit_ImportFrom(self, node):
         base = node.module or ""
         for alias in node.names:
+            if alias.name == '*':
+                logging.warning(f"Wildcard import `from {base} import *` detected in {self.file_path}. "
+                              f"Dependency resolution may be incomplete.")
+                continue  # Skip processing the '*'
+            
             local = alias.asname or alias.name
             # from pkg.utils import foo as bar => 'pkg.utils.foo'
             target = f"{base}.{alias.name}" if base else alias.name
@@ -1145,7 +1188,7 @@ class CodebaseExtractor:
         
         if archive_path.suffix.lower() == '.whl':
             if not WHEEL_SUPPORT:
-                print("Warning: wheel package not available, treating as zip file")
+                logging.warning("wheel package not available, treating as zip file")
                 
         # Extract as zip file (both .zip and .whl are zip formats)
         try:
@@ -1164,7 +1207,7 @@ class CodebaseExtractor:
             shutil.rmtree(self.extracted_path)
 
 
-class CodebaseDependencyAnalyzer:
+class AnalysisRunner:
     """Main application class"""
     
     def __init__(self, codebase_path: str, function_snippet_file: str):
@@ -1449,6 +1492,9 @@ class CodebaseDependencyAnalyzer:
 
 def main():
     """Main entry point"""
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     parser = argparse.ArgumentParser(
         description='Analyze Python codebase dependencies from function snippet',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1483,8 +1529,8 @@ Examples:
         return 1
         
     # Run analysis
-    analyzer = CodebaseDependencyAnalyzer(args.codebase, args.snippet)
-    result = analyzer.run()
+    runner = AnalysisRunner(args.codebase, args.snippet)
+    result = runner.run()
     
     # Format output
     if args.format == 'json':

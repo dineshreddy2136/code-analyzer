@@ -506,7 +506,7 @@ class PythonDependencyAnalyzer:
                     # Progress reporting for large codebases
                     if processed_files % 50 == 0 or processed_files == total_files:
                         progress = (processed_files / total_files) * 100
-                        print(f"Progress: {processed_files}/{total_files} files analyzed ({progress:.1f}%)")
+                        logging.info("Progress: %d/%d files analyzed (%.1f%%)", processed_files, total_files, progress)
                         
                 except Exception as e:
                     logging.warning(f"Error processing {file_path}: {e}")
@@ -520,17 +520,19 @@ class PythonDependencyAnalyzer:
             new_count = current_count + len(functions)
             
             if new_count >= self.max_functions_in_memory:
-                message = f"Warning: Large codebase detected. {new_count} functions would exceed limit of {self.max_functions_in_memory}."
-                print(message)
+                logging.warning(
+                    "Large codebase detected. %d functions would exceed limit of %d.",
+                    new_count, self.max_functions_in_memory
+                )
                 
                 if self.enforce_memory_limit:
-                    print(f"Memory limit enforcement enabled. Rejecting {len(functions)} functions to stay within limit.")
+                    logging.warning("Memory limit enforcement enabled. Rejecting %d functions.", len(functions))
                     # Update stats for rejected functions - not files
                     if hasattr(self, '_analysis_stats'):
                         self._analysis_stats['rejected_functions'] += len(functions)
                     return
                 else:
-                    print("Consider using smaller codebases or increasing max_functions_in_memory, or enable enforce_memory_limit=True.")
+                    logging.info("Consider reducing codebase or increasing max_functions_in_memory, or enable enforce_memory_limit=True.")
                 
             for func in functions:
                 q = func.name                      # qualified
@@ -636,7 +638,7 @@ class PythonDependencyAnalyzer:
             'edges': {k: sorted(v) for k, v in resolved_edges.items()}
         }
 
-    def _get_nested_dependency_levels(self, function_name: str, global_dependencies_by_level: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
+    def _get_nested_dependency_levels(self, function_name: str, _: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
         """Get the nested dependency levels for a specific function"""
         if function_name not in self.func_by_qname:
             return {}
@@ -805,6 +807,7 @@ class PythonDependencyAnalyzer:
         short, scope, owner = dep.short_name, dep.scope_tag, dep.owner
         caller_mod = self.module_of.get(caller_qname, '')
         caller_cls = self.class_of.get(caller_qname)
+        aliases = self.module_aliases.get(caller_mod, {})
 
         # 1) same class (for self./cls.)
         if scope == 'CLASS_LOCAL' and caller_cls:
@@ -819,7 +822,6 @@ class PythonDependencyAnalyzer:
             
         # 3) Check for import aliases in UNSCOPED and OBJ calls
         if scope in ('UNSCOPED', 'OBJ'):
-            aliases = self.module_aliases.get(caller_mod, {})
             # direct function import alias: from pkg.m import foo as bar -> bar()
             if scope == 'UNSCOPED' and short in aliases:
                 target = aliases[short]
@@ -1071,7 +1073,7 @@ class PythonDependencyAnalyzer:
         if len(out) < len(nodes_sorted):
             cyc = [n for n, d in in_deg.items() if d > 0]
             logging.warning(f"{len(cyc)} function(s) in cycle(s): {cyc[:5]}{'...' if len(cyc)>5 else ''}")
-            print("  This may result in incomplete dependency ordering.")
+            logging.warning("  This may result in incomplete dependency ordering.")
         return out
 
 
@@ -1414,19 +1416,19 @@ class AnalysisRunner:
         start_time = time.time()
         try:
             # Step 1: Extract codebase
-            print(f"Extracting codebase from {self.codebase_path}...")
+            logging.info("Extracting codebase from %s...", self.codebase_path)
             extract_start = time.time()
             self.extracted_dir = self.extractor.extract_archive(self.codebase_path)
             extract_time = time.time() - extract_start
-            print(f"Extracted to: {self.extracted_dir} ({extract_time:.2f}s)")
+            logging.info("Extracted to: %s (%.2fs)", self.extracted_dir, extract_time)
             
             # Step 2: Read function snippet
-            print(f"Reading function snippet from {self.function_snippet_file}...")
+            logging.info("Reading function snippet from %s...", self.function_snippet_file)
             with open(self.function_snippet_file, 'r', encoding='utf-8') as f:
                 function_snippet = f.read().strip()
                 
             # Step 3: Find the function in the codebase
-            print("Searching for function in codebase...")
+            logging.info("Searching for function in codebase...")
             search_start = time.time()
             search_result = self._find_function_in_codebase(function_snippet)
             search_time = time.time() - search_start
@@ -1444,7 +1446,7 @@ class AnalysisRunner:
                 }
                 
             # Step 4: Analyze dependencies
-            print("Analyzing function dependencies...")
+            logging.info("Analyzing function dependencies...")
             analysis_start = time.time()
             dependency_result = self._analyze_dependencies(search_result)
             analysis_time = time.time() - analysis_start
@@ -1492,7 +1494,7 @@ class AnalysisRunner:
         
         # Detect language from snippet
         snippet_language = self._detect_snippet_language(function_snippet)
-        print(f"Detected snippet language: {snippet_language}")
+        logging.info("Detected snippet language: %s", snippet_language)
         
         # Extract function name from snippet
         function_name = self._extract_function_name(function_snippet, snippet_language)
@@ -1646,7 +1648,7 @@ class AnalysisRunner:
                 matching_functions.append(name)
                 
         if not matching_functions:
-            print(f"Available functions: {list(analyzer.func_by_qname.keys())}")
+            logging.debug("Available functions: %s", list(analyzer.func_by_qname.keys()))
             return {
                 'dependency_order': [],
                 'detailed_dependencies': [],
@@ -1776,9 +1778,9 @@ Examples:
         if not deps or deps.get('error'):
             output = f"Error: {deps.get('error', 'No dependencies found')}"
         else:
-            func_name = result.get('function_found', {}).get('function_name', 'unknown')
+            start_node = deps.get('start_node', 'unknown')
             edges = deps.get('edges', {})
-            output = emit_dot(edges, func_name)
+            output = emit_dot(edges, start_node)
     elif args.emit == 'text':
         output = _format_text_output(result)
     else:
@@ -1789,7 +1791,7 @@ Examples:
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
             f.write(output)
-        print(f"Results written to: {args.output}")
+        logging.info("Results written to: %s", args.output)
     else:
         # Handle Unicode encoding for Windows console
         try:
@@ -1942,8 +1944,6 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     output.append("Detailed Dependency Information:")
     output.append("=" * 35)
     
-    # Get the analyzer from the result to access function details
-    analyzer = result.get('analyzer')
     if not analyzer:
         output.append("(Function source code not available - analyzer instance not found)")
         output.append("This may indicate an error during codebase analysis.")

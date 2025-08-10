@@ -115,6 +115,20 @@ BUILTIN_METHODS = {
     'appendleft', 'popleft', 'setdefault'
 }
 
+# Built-in functions that should be tracked as dependencies
+BUILTIN_FUNCTIONS = {
+    'abs', 'all', 'any', 'ascii', 'bin', 'bool', 'bytearray', 'bytes',
+    'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr',
+    'dict', 'dir', 'divmod', 'enumerate', 'eval', 'exec', 'filter',
+    'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr',
+    'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance', 'issubclass',
+    'iter', 'len', 'list', 'locals', 'map', 'max', 'memoryview', 'min',
+    'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property',
+    'range', 'repr', 'reversed', 'round', 'set', 'setattr', 'slice',
+    'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple', 'type',
+    'vars', 'zip'
+}
+
 BUILTIN_ATTRS = {
     'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'update', 'get', 'setdefault',
     'keys', 'values', 'items', 'copy', 'sort', 'reverse', 'format', 'join', 'split',
@@ -171,6 +185,7 @@ class FunctionInfo:
     docstring: str = ""
     source_aliases: Dict[str, str] = field(default_factory=dict)
     kind: str = "inst"  # 'inst' | 'static' | 'class'
+    instance_map: Dict[str, str] = field(default_factory=dict)  # Maps variable names to their types/origins
 
 
 @dataclass
@@ -837,10 +852,38 @@ class PythonDependencyAnalyzer:
             if cand in self.func_by_qname:
                 return cand
 
-        # 5) unique across project
+        # 5) unique across project - BUT be conservative with object method calls
         bucket = self.short_index.get(short, set())
         if len(bucket) == 1:
-            return next(iter(bucket))
+            # If this is an object method call (obj.method()), be more skeptical
+            # Only resolve if we have strong confidence it's correct
+            if scope == 'OBJ' and owner not in ['self', 'cls', caller_cls]:
+                # For object method calls, only resolve if the owner suggests it's the right context
+                # or if it's a very common/specific method name pattern
+                resolved_func = next(iter(bucket))
+                
+                # Skip resolution for generic method names that could be on many objects
+                generic_methods = {'is_empty', 'get', 'set', 'add', 'remove', 'update', 'delete', 
+                                   'create', 'save', 'load', 'init', 'reset', 'clear', 'run'}
+                if short in generic_methods:
+                    return None  # Don't guess for generic method names
+                    
+                # Only resolve if the resolved function suggests it belongs to the owner context
+                if owner and resolved_func:
+                    # Check if the owner name appears in the resolved function path
+                    if owner.lower() in resolved_func.lower():
+                        return resolved_func
+                    # Or if it's a clearly project-internal call
+                    elif any(resolved_func.startswith(prefix) for prefix in self.project_prefixes):
+                        # Additional confidence check: does the module/class name relate to owner?
+                        parts = resolved_func.split('.')
+                        if len(parts) >= 2 and any(owner.lower() in part.lower() for part in parts[:-1]):
+                            return resolved_func
+                # For unrecognized object method calls, don't guess
+                return None
+            else:
+                # For UNSCOPED and CLASS_LOCAL calls, the old logic is fine
+                return next(iter(bucket))
 
         # 6) Try constructor for class instantiation (e.g., UserService() -> UserService.__init__)
         # Handle both aliased and direct class calls
@@ -869,6 +912,10 @@ class PythonDependencyAnalyzer:
         # Skip builtin methods and common instance methods that shouldn't be tracked
         if short in BUILTIN_METHODS or (scope == 'OBJ' and owner in ['self', 'cls']):
             return None
+        
+        # Handle built-in functions (new improvement)
+        if scope == 'UNSCOPED' and short in BUILTIN_FUNCTIONS:
+            return f"builtins.{short}"
         
         # Get function info to check imports
         finfo = self.func_by_qname.get(caller_qname)
@@ -1074,6 +1121,44 @@ class _CallFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _AssignmentFinder(ast.NodeVisitor):
+    """Find variable assignments for basic instance tracking"""
+    
+    def __init__(self, aliases=None):
+        self.instance_map = {}  # variable_name -> module/type
+        self.aliases = aliases or {}
+        
+    def visit_Assign(self, node):
+        """Track simple assignments like: engine = create_engine()"""
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            var_name = node.targets[0].id
+            
+            # Try to determine the type/module of the assigned value
+            if isinstance(node.value, ast.Call):
+                if isinstance(node.value.func, ast.Name):
+                    # Direct function call: engine = create_engine()
+                    func_name = node.value.func.id
+                    if func_name in self.aliases:
+                        # Resolve alias to full module path
+                        self.instance_map[var_name] = self.aliases[func_name]
+                    else:
+                        # Store the function name for later resolution
+                        self.instance_map[var_name] = func_name
+                elif isinstance(node.value.func, ast.Attribute):
+                    # Method call: conn = engine.connect()
+                    if isinstance(node.value.func.value, ast.Name):
+                        base_var = node.value.func.value.id
+                        method = node.value.func.attr
+                        if base_var in self.instance_map:
+                            # Chain the type: if engine->sqlalchemy, conn->sqlalchemy.connect
+                            base_type = self.instance_map[base_var]
+                            self.instance_map[var_name] = f"{base_type}.{method}"
+                        else:
+                            self.instance_map[var_name] = f"{base_var}.{method}"
+        
+        self.generic_visit(node)
+
+
 class _ImportFinder(ast.NodeVisitor):
     """Find imports within a function or scope"""
     
@@ -1183,6 +1268,10 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         # Combine module-level and function-level aliases
         all_aliases = self.local_aliases.copy()
         all_aliases.update(import_finder.aliases)
+        
+        # Find variable assignments for basic instance tracking
+        assignment_finder = _AssignmentFinder(all_aliases)
+        assignment_finder.visit(node)
 
         # Normalize to DependencyInfo instances
         normalized: Set[DependencyInfo] = set()
@@ -1210,7 +1299,8 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
             signature=signature,
             docstring=docstring,
             source_aliases=all_aliases,                  # include function-level aliases
-            kind=func_kind
+            kind=func_kind,
+            instance_map=assignment_finder.instance_map  # Add instance tracking
         )
         
     def _get_function_signature(self, node) -> str:

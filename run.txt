@@ -1,9 +1,15 @@
-def extend_nodelist(self, nodelist, node, token):
-    # Check that non-text nodes don't appear before an extends tag.
-    if node.must_be_first and nodelist.contains_nontext:
-        if self.origin.template_name:
-            origin = repr(self.origin.template_name)
-        else:
-            origin = "the template"
-        raise self.error(
-            token,
+def cleanup_application_resources(connection_pool: ConnectionPool, 
+                                cache_manager: CacheManager,
+                                metrics_collector: MetricsCollector) -> Dict[str, Any]:
+    """Cleanup application resources"""
+    cleanup_results = {}
+    
+    # Cleanup database connections
+    try:
+        stale_connections = connection_pool.cleanup_stale_connections(timeout_minutes=30)
+        cleanup_results['database'] = f'Cleaned up {stale_connections} stale connections'
+    except Exception as e:
+        cleanup_results['database'] = f'Error cleaning database: {str(e)}'
+    
+    # Cleanup cache
+    try:

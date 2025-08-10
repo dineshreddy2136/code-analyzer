@@ -400,7 +400,7 @@ class PythonDependencyAnalyzer:
                     continue
                 
                 # Resolve internal dependency to a function in our list
-                resolved_dep = self._resolve_dependency(dep)
+                resolved_dep = self._resolve_dependency(dep, current_func)
                 
                 if resolved_dep and resolved_dep not in visited_resolved:
                     visited_resolved.add(resolved_dep)
@@ -435,6 +435,52 @@ class PythonDependencyAnalyzer:
         
         return result
 
+    def _get_nested_dependency_levels(self, function_name: str, global_dependencies_by_level: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
+        """Get the nested dependency levels for a specific function"""
+        if function_name not in self.functions:
+            return {}
+        
+        # Get direct dependencies of this specific function
+        direct_deps = set(self.functions[function_name].dependencies)
+        user_defined_direct_deps = {self._resolve_dependency(dep, function_name) for dep in direct_deps if self._resolve_dependency(dep, function_name)}
+        user_defined_direct_deps = {dep for dep in user_defined_direct_deps if dep and dep != function_name}
+        
+        if not user_defined_direct_deps:
+            return {}
+        
+        # Build nested levels by tracing this function's specific dependency chain
+        nested_levels = {}
+        
+        # Level 2: Direct dependencies of this function
+        nested_levels[2] = user_defined_direct_deps
+        
+        current_level_deps = user_defined_direct_deps
+        visited_deps = set([function_name])  # Track visited to prevent cycles
+        level = 3  # Start at level 3 for next level dependencies
+        
+        while current_level_deps and level <= 6:  # Limit depth to prevent infinite recursion
+            next_level_deps = set()
+            
+            # For each dependency at current level, find its dependencies
+            for dep in current_level_deps:
+                if dep in self.functions and dep not in visited_deps:
+                    visited_deps.add(dep)
+                    dep_dependencies = set(self.functions[dep].dependencies)
+                    resolved_deps = {self._resolve_dependency(d, dep) for d in dep_dependencies if self._resolve_dependency(d, dep)}
+                    # Only include user-defined functions that haven't been visited
+                    resolved_deps = {d for d in resolved_deps if d and d not in visited_deps and d in self.functions}
+                    next_level_deps.update(resolved_deps)
+            
+            if next_level_deps:
+                nested_levels[level] = next_level_deps
+                current_level_deps = next_level_deps
+            else:
+                break
+                
+            level += 1
+        
+        return nested_levels
+
     def _get_external_function_info(self, qname: str) -> Optional[Dict[str, Any]]:
         """Get basic information about external/standard library functions"""
         external_functions = {
@@ -462,7 +508,7 @@ class PythonDependencyAnalyzer:
         }
         return external_functions.get(qname)
         
-    def _resolve_dependency(self, dep_name: str) -> Optional[str]:
+    def _resolve_dependency(self, dep_name: str, current_function_context: Optional[str] = None) -> Optional[str]:
         """Resolves a raw dependency string to a function name in the codebase."""
         # 1. Direct match
         if dep_name in self.functions:
@@ -475,13 +521,33 @@ class PythonDependencyAnalyzer:
 
         # 3. Heuristic for obj.method or Class.method
         if '.' in dep_name:
-            # For "var.method", we can't know the type of "var", so we search for
-            # any class method named "method". This is an approximation.
             method_name = dep_name.split('.')[-1]
-            # Prefer matches where the class name seems plausible, but it's a guess.
+            obj_name = dep_name.split('.')[0]
+            
+            # Collect all possible matches
+            possible_matches = []
             for func_name in self.functions:
                 if func_name.endswith(f".{method_name}"):
-                    return func_name  # Return the first match found
+                    possible_matches.append(func_name)
+            
+            if not possible_matches:
+                return None
+                
+            # If we have multiple matches, try to be smarter about resolution
+            if len(possible_matches) == 1:
+                return possible_matches[0]
+            
+            # For 'self.method', prefer methods from the same class if we can determine context
+            if obj_name == 'self' and current_function_context:
+                # Extract class name from current function context (e.g., "ClassName.method" -> "ClassName")
+                if '.' in current_function_context:
+                    current_class = current_function_context.split('.')[0]
+                    class_method = f"{current_class}.{method_name}"
+                    if class_method in possible_matches:
+                        return class_method
+            
+            # Return the first match as fallback
+            return possible_matches[0]
 
         return None
         
@@ -1068,6 +1134,23 @@ def _format_text_output(result: Dict[str, Any]) -> str:
                     
                     if func_info.docstring:
                         output.append(f"Docstring: {func_info.docstring}")
+                    
+                    # Show nested dependencies for Level-1 functions
+                    if level == 1:
+                        nested_deps = analyzer._get_nested_dependency_levels(dep_name, dependencies_by_level)
+                        if nested_deps:
+                            output.append("\nNested Dependencies:")
+                            for nested_level, nested_funcs in sorted(nested_deps.items()):
+                                if nested_funcs:
+                                    output.append(f"  Level-{nested_level}: {', '.join(sorted(nested_funcs))}")
+                    
+                    # Show direct dependencies for Level-2+ functions
+                    elif level > 1 and dep_name in analyzer.functions:
+                        func_deps = analyzer.functions[dep_name].dependencies
+                        resolved_deps = [analyzer._resolve_dependency(d, dep_name) for d in func_deps]
+                        resolved_deps = [d for d in resolved_deps if d and d in analyzer.functions]
+                        if resolved_deps:
+                            output.append(f"\nDirect Dependencies: {', '.join(sorted(resolved_deps))}")
                     
                     output.append("\nSource Code:")
                     output.append("-" * 60)

@@ -1,43 +1,5 @@
-def import_(self) -> Response:
-        """Import themes from a ZIP file.
-        ---
-        post:
-          summary: Import themes from a ZIP file
-          requestBody:
-            required: true
-            content:
-              multipart/form-data:
-                schema:
-                  type: object
-                  properties:
-                    formData:
-                      type: string
-                      format: binary
-                    overwrite:
-                      type: string
-          responses:
-            200:
-              description: Theme imported
-              content:
-                application/json:
-                  schema:
-                    type: object
-                    properties:
-                      message:
-                        type: string
-            400:
-              $ref: '#/components/responses/400'
-            401:
-              $ref: '#/components/responses/401'
-            422:
-              $ref: '#/components/responses/422'
-            500:
-              $ref: '#/components/responses/500'
-        """
-        upload = request.files.get("formData")
-        if not upload:
-            return self.response_400()
-        if not isinstance(upload, FileStorage):
-            return self.response_400()
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
 
-    
+    In this scenario we need to create an Engine
+    and associate a connection with the context.

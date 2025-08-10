@@ -400,6 +400,8 @@ class PythonDependencyAnalyzer:
             max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Use constant
             if file_stats.st_size > max_file_size:
                 logging.warning(f"Skipping large file {relative_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
+                if hasattr(self, '_analysis_stats'):
+                    self._analysis_stats['skipped_files'] += 1
                 return []
                 
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -414,6 +416,8 @@ class PythonDependencyAnalyzer:
             
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
             logging.warning(f"Could not parse {file_path}: {e}")
+            if hasattr(self, '_analysis_stats'):
+                self._analysis_stats['skipped_files'] += 1
             return []
             
     def analyze_codebase(self) -> None:
@@ -919,13 +923,18 @@ class PythonDependencyAnalyzer:
         short, scope, owner = dep.short_name, dep.scope_tag, dep.owner
         caller_mod = self.module_of.get(caller_qname, '')
         
-        # Skip builtin methods and common instance methods that shouldn't be tracked
-        if short in BUILTIN_METHODS or (scope == 'OBJ' and owner in ['self', 'cls']):
-            return None
-        
-        # Handle built-in functions (new improvement)
+        # Handle built-in *functions* first so we don't exit early
         if scope == 'UNSCOPED' and short in BUILTIN_FUNCTIONS:
             return f"builtins.{short}"
+
+        # Skip common instance methods we never want to follow
+        if scope == 'OBJ' and owner in ['self', 'cls']:
+            return None
+
+        # Don't blanket-skip names like 'exists'—they may be stdlib (e.g., os.path.exists).
+        # Only treat them as ignorable when there's no owner (i.e., bare foo()).
+        if short in BUILTIN_METHODS and not owner:
+            return None
         
         # Get function info to check imports
         finfo = self.func_by_qname.get(caller_qname)
@@ -1690,6 +1699,16 @@ def emit_dot(edges: Dict[str, Set[str]], start: str, external_edges: Dict[str, S
     lines.append('  node [shape=box];')
     lines.append('  rankdir=LR;')
     lines.append(f'  "{start}" [style=filled,fillcolor=lightblue];')
+    
+    # Collect all external nodes for styling
+    external_nodes = set()
+    if external_edges:
+        for vs in external_edges.values():
+            external_nodes.update(vs)
+    
+    # Style external nodes differently
+    for node in sorted(external_nodes):
+        lines.append(f'  "{node}" [shape=ellipse,style=dashed];')
     
     for u, vs in sorted(edges.items()):
         for v in sorted(vs):

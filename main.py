@@ -181,8 +181,9 @@ class ContentSearchEngine:
                 
                 # Skip very large files to prevent memory issues
                 file_stats = full_path.stat()
-                if file_stats.st_size > 50 * 1024 * 1024:  # Skip files larger than 50MB
-                    print(f"Warning: Skipping large file {file_path} ({file_stats.st_size} bytes) in content search")
+                max_file_size = 10 * 1024 * 1024  # Standardized 10MB limit
+                if file_stats.st_size > max_file_size:
+                    print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB) in content search")
                     continue
                     
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -263,8 +264,9 @@ class PythonDependencyAnalyzer:
         try:
             # Check file size to avoid loading extremely large files
             file_stats = full_path.stat()
-            if file_stats.st_size > 10 * 1024 * 1024:  # Skip files larger than 10MB
-                print(f"Warning: Skipping large file {file_path} ({file_stats.st_size} bytes)")
+            max_file_size = 10 * 1024 * 1024  # Standardized 10MB limit
+            if file_stats.st_size > max_file_size:
+                print(f"Warning: Skipping large file {file_path} ({file_stats.st_size / (1024*1024):.1f}MB)")
                 return []
                 
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -278,6 +280,9 @@ class PythonDependencyAnalyzer:
             
         except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
             print(f"Warning: Could not parse {file_path}: {e}")
+            # Update stats for skipped files
+            if hasattr(self, '_analysis_stats'):
+                self._analysis_stats['skipped_files'] += 1
             return []
             
     def analyze_codebase(self) -> None:
@@ -291,6 +296,14 @@ class PythonDependencyAnalyzer:
                     python_files.append(str(rel_path))
                     
         print(f"Analyzing {len(python_files)} Python files...")
+        
+        # Track analysis statistics
+        self._analysis_stats = {
+            'total_files': len(python_files),
+            'skipped_files': 0,
+            'parsed_functions': 0,
+            'analysis_start_time': time.time()
+        }
         
         # Use parallel processing for large codebases
         if len(python_files) > 10:
@@ -315,6 +328,12 @@ class PythonDependencyAnalyzer:
                             prefixes.add(top)
         self.project_prefixes = prefixes
         print(f"Project prefixes (internal): {sorted(self.project_prefixes)}")
+        
+        # Print analysis summary
+        analysis_time = time.time() - self._analysis_stats['analysis_start_time']
+        print(f"Analysis complete: {self._analysis_stats['parsed_functions']} functions parsed in {analysis_time:.2f}s")
+        if self._analysis_stats['skipped_files'] > 0:
+            print(f"Skipped {self._analysis_stats['skipped_files']} files due to size/parse errors")
         
     def _is_internal(self, qname: str) -> bool:
         """Check if a qualified name is internal to the project"""
@@ -362,9 +381,12 @@ class PythonDependencyAnalyzer:
     def _store_functions(self, functions: List[FunctionInfo]) -> None:
         """Store function information thread-safely with memory management"""
         with self._lock:
+            # Check memory limits
+            if len(self.functions) >= self.max_functions_in_memory:
+                print(f"Warning: Large codebase detected. {len(self.functions)} functions in memory.")
+                print(f"Consider using smaller codebases or increasing max_functions_in_memory.")
+                
             for func in functions:
-                if len(self.functions) >= self.max_functions_in_memory:
-                    print(f"Warning: Large codebase detected. {len(self.functions)} functions in memory.")
                 q = func.name                      # qualified
                 self.functions[q] = func           # keep legacy map working
                 self.func_by_qname[q] = func
@@ -386,6 +408,10 @@ class PythonDependencyAnalyzer:
                 # Store module-level aliases
                 mod = self.module_of[q]
                 self.module_aliases.setdefault(mod, {}).update(func.source_aliases)
+                
+            # Update stats
+            if hasattr(self, '_analysis_stats'):
+                self._analysis_stats['parsed_functions'] = len(self.functions)
                 
     def find_function_dependencies(self, function_name: str, organize_by_levels: bool = False) -> Dict[str, Any]:
         """Find all dependencies for a function in correct order, optionally organized by levels"""
@@ -433,19 +459,17 @@ class PythonDependencyAnalyzer:
                 short = dep[0]
                 all_raw_shortnames.add(short)
 
-                # keep your stdlib external examples if you want
-                if short in {'randbelow', 'randbytes', 'getrandbits'}:
-                    external_dependencies.add(f"secrets.{short}")
-                    if organize_by_levels:
-                        dependencies_by_level.setdefault(level+1, set()).add(f"secrets.{short}")
-                    continue
-
                 tgt = self._resolve_dependency(cur, dep)
                 if tgt and self._is_internal(tgt):
                     resolved_edges[cur].add(tgt)
                     if tgt not in visited:
                         visited.add(tgt)
                         queue.append((tgt, level+1))
+                elif tgt and not self._is_internal(tgt):
+                    # External dependency found
+                    external_dependencies.add(tgt)
+                    if organize_by_levels:
+                        dependencies_by_level.setdefault(level+1, set()).add(tgt)
 
         # Ensure edges only include nodes present in visited set
         resolved_edges = {u: {v for v in vs if v in visited} for u, vs in resolved_edges.items()}
@@ -608,24 +632,41 @@ class PythonDependencyAnalyzer:
             return next(iter(bucket))
 
         # 6) Try constructor for class instantiation (e.g., UserService() -> UserService.__init__)
-        if scope == 'UNSCOPED' and short in aliases:
-            target = aliases[short]
-            # Try with __init__
-            init_targets = []
-            if not target.startswith(tuple(self.project_prefixes)):
-                for prefix in self.project_prefixes:
-                    abs_target = f"{prefix}.{target}.__init__"
-                    if abs_target in self.func_by_qname and self._is_internal(abs_target):
-                        init_targets.append(abs_target)
-            else:
-                init_target = f"{target}.__init__"
-                if init_target in self.func_by_qname and self._is_internal(init_target):
-                    init_targets.append(init_target)
+        # Handle both aliased and direct class calls
+        if scope == 'UNSCOPED':
+            # Check if it's an aliased class
+            if short in aliases:
+                target = aliases[short]
+                init_targets = self._try_constructor_resolution(target)
+                if len(init_targets) == 1:
+                    return init_targets[0]
             
-            if len(init_targets) == 1:
-                return init_targets[0]
+            # Also try direct class instantiation (MyClass() when MyClass is in same module)
+            # Look for class.short pattern in same module
+            class_pattern = f"{caller_mod}.{short}"
+            init_candidate = f"{class_pattern}.__init__"
+            if init_candidate in self.func_by_qname and self._is_internal(init_candidate):
+                return init_candidate
 
         return None   # ambiguous → drop
+    
+    def _try_constructor_resolution(self, target: str) -> List[str]:
+        """Try to resolve constructor calls for class instantiation"""
+        init_targets = []
+        
+        # Handle relative targets
+        if not target.startswith(tuple(self.project_prefixes)):
+            for prefix in self.project_prefixes:
+                abs_target = f"{prefix}.{target}.__init__"
+                if abs_target in self.func_by_qname and self._is_internal(abs_target):
+                    init_targets.append(abs_target)
+        else:
+            # Absolute target
+            init_target = f"{target}.__init__"
+            if init_target in self.func_by_qname and self._is_internal(init_target):
+                init_targets.append(init_target)
+                
+        return init_targets
         
     def _topological_sort_resolved(self, nodes: Set[str], edges: Dict[str, Set[str]]) -> List[str]:
         """Sort functions in dependency order using resolved edges"""
@@ -645,7 +686,9 @@ class PythonDependencyAnalyzer:
                     q.append(v)
         if len(out) < len(nodes):
             cyc = [n for n, d in in_deg.items() if d > 0]
-            print(f"Warning: cycle(s) detected among: {cyc}")
+            print(f"Warning: cycle(s) detected among: {cyc[:5]}{'...' if len(cyc) > 5 else ''}")
+            print(f"  This may result in incomplete dependency ordering.")
+            # Still return partial order - better than nothing
         return out
 
 
@@ -867,11 +910,14 @@ class CodebaseDependencyAnalyzer:
     def run(self) -> Dict[str, Any]:
         """Run the complete analysis"""
         keep = bool(os.environ.get("CDA_KEEP_EXTRACTED"))
+        start_time = time.time()
         try:
             # Step 1: Extract codebase
             print(f"Extracting codebase from {self.codebase_path}...")
+            extract_start = time.time()
             self.extracted_dir = self.extractor.extract_archive(self.codebase_path)
-            print(f"Extracted to: {self.extracted_dir}")
+            extract_time = time.time() - extract_start
+            print(f"Extracted to: {self.extracted_dir} ({extract_time:.2f}s)")
             
             # Step 2: Read function snippet
             print(f"Reading function snippet from {self.function_snippet_file}...")
@@ -880,17 +926,29 @@ class CodebaseDependencyAnalyzer:
                 
             # Step 3: Find the function in the codebase
             print("Searching for function in codebase...")
+            search_start = time.time()
             search_result = self._find_function_in_codebase(function_snippet)
+            search_time = time.time() - search_start
             
             if not search_result:
+                total_time = time.time() - start_time
                 return {
                     'error': 'Function not found in codebase',
-                    'function_snippet': function_snippet
+                    'function_snippet': function_snippet,
+                    'timing': {
+                        'total_time': total_time,
+                        'extract_time': extract_time,
+                        'search_time': search_time
+                    }
                 }
                 
             # Step 4: Analyze dependencies
             print("Analyzing function dependencies...")
+            analysis_start = time.time()
             dependency_result = self._analyze_dependencies(search_result)
+            analysis_time = time.time() - analysis_start
+            
+            total_time = time.time() - start_time
             
             return {
                 'success': True,
@@ -898,13 +956,23 @@ class CodebaseDependencyAnalyzer:
                 'dependencies': dependency_result,
                 'analyzer': dependency_result.get('analyzer'),  # Pass the analyzer from dependency result
                 'codebase_path': self.codebase_path,
-                'extracted_to': self.extracted_dir if keep else None
+                'extracted_to': self.extracted_dir if keep else None,
+                'timing': {
+                    'total_time': total_time,
+                    'extract_time': extract_time,
+                    'search_time': search_time,
+                    'analysis_time': analysis_time
+                }
             }
             
         except Exception as e:
+            total_time = time.time() - start_time
             return {
                 'error': str(e),
-                'codebase_path': self.codebase_path
+                'codebase_path': self.codebase_path,
+                'timing': {
+                    'total_time': total_time
+                }
             }
         finally:
             # Clean up
@@ -937,6 +1005,18 @@ class CodebaseDependencyAnalyzer:
         
         # Extract function name from snippet
         function_name = self._extract_function_name(function_snippet, snippet_language)
+        
+        # If function_name is a qualified name, skip file search and use it directly
+        if function_name and '.' in function_name and function_name.count('.') >= 2:
+            # This looks like a qualified function name, use it directly
+            return {
+                'file_path': 'N/A - using qualified name',
+                'line_number': 0,
+                'function_name': function_name,
+                'search_method': 'qualified_name',
+                'language': snippet_language
+            }
+        
         if not function_name:
             # Fallback to content search
             file_patterns = ['*.py']
@@ -997,6 +1077,12 @@ class CodebaseDependencyAnalyzer:
         
     def _extract_function_name(self, snippet: str, language: str = 'python') -> Optional[str]:
         """Extract function name from code snippet"""
+        # First check if snippet is already a qualified function name
+        stripped = snippet.strip()
+        if '.' in stripped and not any(keyword in stripped for keyword in ['def ', 'class ', 'import ', '(', ')', '{', '}', '\n']):
+            # Looks like a qualified name (e.g., "test.models.UserRepository.save")
+            return stripped
+        
         # Try to parse as Python code first
         try:
             tree = ast.parse(snippet)
@@ -1017,6 +1103,10 @@ class CodebaseDependencyAnalyzer:
             match = re.search(pattern, snippet)
             if match:
                 return match.group(1)
+        
+        # If it's just a function name without code structure
+        if stripped and stripped.replace('.', '_').replace('_', '').isalnum():
+            return stripped
                 
         return None
         
@@ -1036,21 +1126,47 @@ class CodebaseDependencyAnalyzer:
         for qname in analyzer.func_by_qname.keys():
             if qname.endswith(f".{function_name}"):
                 possible_names.append(qname)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_names = []
+        for name in possible_names:
+            if name not in seen:
+                seen.add(name)
+                unique_names.append(name)
+        possible_names = unique_names
             
         found_function_name = None
+        matching_functions = []
+        
+        # Find all matches in the codebase
         for name in possible_names:
             if name in analyzer.func_by_qname:
-                found_function_name = name
-                break
+                matching_functions.append(name)
                 
-        if not found_function_name:
+        if not matching_functions:
             print(f"Available functions: {list(analyzer.func_by_qname.keys())}")
             return {
                 'dependency_order': [],
                 'detailed_dependencies': [],
                 'total_dependencies': 0,
                 'analysis_method': 'python_function_not_found',
-                'error': f'Function {function_name} not found in analyzed functions'
+                'error': f'Function {function_name} not found in analyzed functions',
+                'analyzer': analyzer  # Pass analyzer even in error cases
+            }
+        elif len(matching_functions) == 1:
+            found_function_name = matching_functions[0]
+        else:
+            # Multiple matches - treat as ambiguous
+            return {
+                'dependency_order': [],
+                'detailed_dependencies': [],
+                'total_dependencies': 0,
+                'analysis_method': 'ambiguous_function',
+                'ambiguous_function': True,
+                'candidates': matching_functions[:10],  # Limit to first 10
+                'error': f'Function name "{function_name}" is ambiguous. Multiple matches found.',
+                'analyzer': analyzer
             }
         
         dependencies_result = analyzer.find_function_dependencies(found_function_name, organize_by_levels=True)
@@ -1131,22 +1247,24 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     # Check for dependency-level errors first
     deps = result.get('dependencies', {})
     if deps.get('error'):
-        return f"Error: {deps['error']}"
+        if deps.get('ambiguous_function'):
+            output = ["Codebase Dependency Analysis Results", "=" * 40, ""]
+            output.append("⚠️  Function name is ambiguous!")
+            cands = deps.get('candidates', [])
+            if cands:
+                output.append("Available candidates:")
+                for i, cand in enumerate(cands[:10], 1):  # Show max 10
+                    output.append(f"  {i}. {cand}")
+                output.append("")
+                output.append("Please specify the fully qualified name (e.g., test.models.UserRepository.save)")
+            return "\n".join(output)
+        else:
+            return f"Error: {deps['error']}"
         
     # Check for ambiguous function
     if deps.get('ambiguous_function'):
-        output = ["Codebase Dependency Analysis Results", "=" * 40, ""]
-        output.append("⚠️  Function name is ambiguous!")
-        cands = deps.get('candidates', [])
-        if cands:
-            output.append("Available candidates:")
-            for i, cand in enumerate(cands, 1):
-                output.append(f"  {i}. {cand}")
-            output.append("")
-            output.append("Please specify the fully qualified name (e.g., pkg.module.Class.method)")
-        else:
-            output.append("No matching functions found in the codebase.")
-        return "\n".join(output)
+        # This section is now handled above in error checking
+        pass
     output = ["Codebase Dependency Analysis Results"]
     output.append("=" * 40)
     output.append("")
@@ -1157,6 +1275,21 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     output.append(f"File: {func_info['file_path']}")
     output.append(f"Line: {func_info['line_number']}")
     output.append(f"Search method: {func_info['search_method']}")
+    
+    # Add timing information
+    timing = result.get('timing', {})
+    if timing:
+        output.append("")
+        output.append("Performance Metrics:")
+        output.append("-" * 20)
+        output.append(f"Total Time: {timing.get('total_time', 0):.2f}s")
+        if 'extract_time' in timing:
+            output.append(f"Extraction Time: {timing['extract_time']:.2f}s")
+        if 'search_time' in timing:
+            output.append(f"Search Time: {timing['search_time']:.2f}s")
+        if 'analysis_time' in timing:
+            output.append(f"Analysis Time: {timing['analysis_time']:.2f}s")
+    
     output.append("")
     
     # Dependencies - organize by levels if available
@@ -1214,6 +1347,7 @@ def _format_text_output(result: Dict[str, Any]) -> str:
     analyzer = result.get('analyzer')
     if not analyzer:
         output.append("(Function source code not available - analyzer instance not found)")
+        output.append("This may indicate an error during codebase analysis.")
         return "\n".join(output)
     
     # Show detailed info organized by levels if available

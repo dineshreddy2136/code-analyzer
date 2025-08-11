@@ -1343,6 +1343,44 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
         assignment_finder = _AssignmentFinder(all_aliases)
         assignment_finder.visit(node)
 
+        # --- NEW: seed instance_map from parameter annotations ---
+        # Convert annotations like ConnectionPool, utils.ConnectionPool, Optional[CacheManager], etc.
+        def _ann_to_text(ann):
+            # Return a dotted path string if we can (e.g., "pkg.mod.Name" or "Name")
+            if isinstance(ann, ast.Name):
+                return ann.id
+            if isinstance(ann, ast.Attribute):
+                parts = []
+                cur = ann
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    parts.append(cur.id)
+                parts.reverse()
+                return ".".join(parts)
+            if isinstance(ann, ast.Subscript):
+                # Handle typing wrappers like Optional[T], List[T], Dict[K, V] — use outer value
+                return _ann_to_text(ann.value)
+            # Strings / complex forward refs are ignored (best-effort only)
+            return None
+
+        param_instance_hints = {}
+        for arg in node.args.args:
+            if getattr(arg, "annotation", None) is None:
+                continue
+            hint = _ann_to_text(arg.annotation)
+            if not hint:
+                continue
+
+            # Resolve through local/module aliases when possible
+            resolved = all_aliases.get(hint, hint)
+            param_instance_hints[arg.arg] = resolved
+
+        # Merge parameter-derived hints into assignment-derived instance map
+        if param_instance_hints:
+            assignment_finder.instance_map.update(param_instance_hints)
+
         # Normalize to DependencyInfo instances
         normalized: Set[DependencyInfo] = set()
         for c in call_finder.calls:

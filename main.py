@@ -460,11 +460,24 @@ class PythonDependencyAnalyzer:
             for f in files:
                 if f.endswith('.py'):
                     rel_dir = Path(root).relative_to(self.root_dir)
-                    if rel_dir.parts:  # Only process files in subdirectories
+                    if rel_dir.parts:  # Files in subdirectories
                         top = rel_dir.parts[0]
                         # Accept any directory containing Python files, but prefer packages with __init__.py
                         if top not in SKIP_TOPS and not _is_meta_dir(top):
                             prefixes.add(top)
+        
+        # Include root-level Python files as top-level modules (fix for single-file zips)
+        for file in os.listdir(self.root_dir):
+            if file.endswith(".py"):
+                module_name = Path(file).stem  # e.g. 'lambda_function' from 'lambda_function.py'
+                prefixes.add(module_name)
+                
+        # Also include top modules from parsed functions (additional safety net)
+        for qname in self.func_by_qname.keys():
+            top = qname.split('.', 1)[0]
+            if top:
+                prefixes.add(top)
+                
         self.project_prefixes = prefixes
         logging.info(f"Project prefixes (internal): {sorted(self.project_prefixes)}")
         

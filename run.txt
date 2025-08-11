@@ -1,16 +1,7 @@
-def cleanup_application_resources(connection_pool: ConnectionPool, 
-                                cache_manager: CacheManager,
-                                metrics_collector: MetricsCollector) -> Dict[str, Any]:
-    """Cleanup application resources"""
-    cleanup_results = {}
-    
-    # Cleanup database connections
+def handler(event, context):
+    """
+    S3 ObjectCreated event → transform → S3 (gzip ndjson)
+    """
+    t0 = time.time()
+    # Extract S3 info (supports single-record events)
     try:
-        stale_connections = connection_pool.cleanup_stale_connections(timeout_minutes=30)
-        cleanup_results['database'] = f'Cleaned up {stale_connections} stale connections'
-    except Exception as e:
-        cleanup_results['database'] = f'Error cleaning database: {str(e)}'
-    
-    # Cleanup cache
-    try:
-        expired_entries = cache_manager.cleanup_expired()

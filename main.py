@@ -22,6 +22,7 @@ import sys
 import re
 import ast
 import json
+import html
 import logging
 import zipfile
 import tempfile
@@ -1768,37 +1769,91 @@ class AnalysisRunner:
         return dependencies_result
 
 
+def _make_tooltip(func_info, max_src_lines=12):
+    """Generate tooltip text with function signature, location, and source preview"""
+    src = func_info.source_code.splitlines()
+    preview = "\n".join(src[:max_src_lines])
+    tip = f"{func_info.signature}\n{func_info.file_path}:{func_info.line_number}\n\n{preview}"
+    # HTML escape and then escape newlines for DOT format
+    escaped = html.escape(tip, quote=True)
+    # Replace actual newlines with \n for DOT syntax
+    return escaped.replace('\n', '\\n')
+
+
 def emit_dot(
     edges: Dict[str, Set[str]],
     start: str,
     external_edges: Dict[str, Set[str]] = None,
-    cycle_nodes: Optional[List[str]] = None
+    cycle_nodes: Optional[List[str]] = None,
+    func_map: Optional[Dict[str, Any]] = None,
+    link_mode: Optional[Tuple[str, str]] = None
 ) -> str:
-    """Emit dependencies as Graphviz DOT format with rich styling"""
+    """Emit dependencies as Graphviz DOT format with rich styling and interactive features
+    
+    Args:
+        edges: Internal dependency edges
+        start: Start node name
+        external_edges: External dependency edges
+        cycle_nodes: Nodes involved in cycles
+        func_map: Map from function names to FunctionInfo objects for tooltips
+        link_mode: Tuple of (mode, base) where:
+                  ("vscode", project_root_abs) -> vscode://file/... links
+                  ("github", repo_url_prefix) -> GitHub links
+    """
     cycle_nodes = set(cycle_nodes or [])
     lines = ["digraph deps {"]
     lines.append('  rankdir=LR;')
     lines.append('  node [shape=box, fontsize=10];')
     lines.append('  edge [arrowsize=0.7];')
 
-    # start node highlight
-    lines.append(f'  "{start}" [style=filled, fillcolor=lightblue];')
-
-    # external node styling (ellipse + dashed)
+    # collect all internal nodes
+    internal_nodes = set(edges.keys())
+    for vs in edges.values():
+        internal_nodes.update(vs)
+    
+    # collect external nodes
     external_nodes = set()
     if external_edges:
         for vs in external_edges.values():
             external_nodes.update(vs)
-    for node in sorted(external_nodes):
-        # if cyclic AND external (unlikely), prioritize cycle styling
-        if node in cycle_nodes:
-            lines.append(f'  "{node}" [shape=doublecircle, color=red, penwidth=2];')
-        else:
-            lines.append(f'  "{node}" [shape=ellipse, style=dashed];')
 
-    # cycle nodes styling (internal)
-    for node in sorted(cycle_nodes - external_nodes):
-        lines.append(f'  "{node}" [shape=doublecircle, color=red, penwidth=2];')
+    # render internal nodes with tooltips/links
+    for node in sorted(internal_nodes):
+        attrs = ['shape=box']
+        
+        # styling based on node type
+        if node == start:
+            attrs += ['style=filled', 'fillcolor=lightblue']
+        elif node in cycle_nodes:
+            attrs += ['shape=doublecircle', 'color=red', 'penwidth=2']
+            
+        # add tooltip and links if func_map provided
+        if func_map and node in func_map:
+            fi = func_map[node]
+            tooltip = _make_tooltip(fi)
+            attrs.append(f'tooltip="{tooltip}"')
+
+            if link_mode:
+                kind, base = link_mode
+                if kind == "vscode":
+                    href = f'vscode://file/{base.rstrip("/")}/{fi.file_path}:{fi.line_number}'
+                elif kind == "github":
+                    href = f'{base.rstrip("/")}/{fi.file_path}#L{fi.line_number}'
+                else:
+                    href = None
+                if href:
+                    attrs.append(f'href="{href}"')
+                    attrs.append('target="_top"')
+        
+        lines.append(f'  "{node}" [{", ".join(attrs)}];')
+
+    # render external nodes (keep dashed/ellipse style)
+    for node in sorted(external_nodes):
+        attrs = ['shape=ellipse', 'style=dashed']
+        if node in cycle_nodes:
+            attrs = ['shape=doublecircle', 'color=red', 'penwidth=2']
+        attrs.append(f'tooltip="{html.escape(node)}"')
+        lines.append(f'  "{node}" [{", ".join(attrs)}];')
 
     # internal edges (solid)
     for u, vs in sorted(edges.items()):
@@ -1920,7 +1975,12 @@ Examples:
             edges = deps.get('edges', {})
             external_edges = deps.get('external_edges', {})
             cycle_nodes = deps.get('cycle_nodes', [])
-            output = emit_dot(edges, start_node, external_edges, cycle_nodes)
+            # Get analyzer for function info tooltips
+            analyzer = result.get('analyzer')
+            func_map = analyzer.func_by_qname if analyzer else None
+            # TODO: Add CLI args for link_mode if desired
+            link_mode = None
+            output = emit_dot(edges, start_node, external_edges, cycle_nodes, func_map, link_mode)
     elif args.emit == 'text':
         output = _format_text_output(result)
     else:

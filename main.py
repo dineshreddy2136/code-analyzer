@@ -1171,6 +1171,9 @@ class _CallFinder(ast.NodeVisitor):
                     # the immediate parent as the owner: path.exists
                     if len(chain_parts) >= 2:
                         owner = chain_parts[-1]  # 'path' in os.path.exists
+                        # NEW: skip common built-in container methods to avoid false externals
+                        if method_name in BUILTIN_METHODS or method_name in BUILTIN_ATTRS:
+                            return
                         full_call = f"{owner}.{method_name}"
                         self.calls.add(full_call)
             else:

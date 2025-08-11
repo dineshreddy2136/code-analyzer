@@ -1841,34 +1841,46 @@ def emit_dot(
 
     # render internal nodes with tooltips/links
     for node in sorted(internal_nodes):
-        attrs = ['shape=box']
+        base_attrs = ['shape=box', 'fontsize=10']
         
         # styling based on node type
         if node == start:
-            attrs += ['style=filled', 'fillcolor=lightblue']
+            base_attrs += ['style=filled', 'fillcolor=lightblue']
         elif node in cycle_nodes:
-            attrs += ['shape=doublecircle', 'color=red', 'penwidth=2']
+            base_attrs += ['shape=doublecircle', 'color=red', 'penwidth=2']
             
-        # add tooltip and links if func_map provided
+        # Tooltip (code preview)
+        tip = None
+        fi = None
         if func_map and node in func_map:
             fi = func_map[node]
             max_lines = tooltip_lines if tooltip_lines > 0 else None
-            tooltip = _make_tooltip(fi, max_src_lines=max_lines)
-            attrs.append(f'tooltip="{tooltip}"')
+            tip = _make_tooltip(fi, max_src_lines=max_lines)
+            base_attrs.append(f'tooltip="{tip}"')
 
-            if link_mode:
-                kind, base = link_mode
-                if kind == "vscode":
-                    href = f'vscode://file/{base.rstrip("/")}/{fi.file_path}:{fi.line_number}'
-                elif kind == "github":
-                    href = f'{base.rstrip("/")}/{fi.file_path}#L{fi.line_number}'
-                else:
-                    href = None
-                if href:
-                    attrs.append(f'href="{href}"')
-                    attrs.append('target="_top"')
-        
-        lines.append(f'  "{node}" [{", ".join(attrs)}];')
+        # Build href (but we won't set it on the node—only on the small icon cell)
+        href = None
+        if fi and link_mode:
+            kind, base = link_mode
+            if kind == "vscode":
+                href = f'vscode://file/{base.rstrip("/")}/{fi.file_path}:{fi.line_number}'
+            elif kind == "github":
+                href = f'{base.rstrip("/")}/{fi.file_path}#L{fi.line_number}'
+
+        if href:
+            # HTML-like label with a small right-aligned clickable cell
+            safe_node = html.escape(node, quote=True)
+            link_cell = f'<TD HREF="{href}" TARGET="_top" PORT="link" ALIGN="right" WIDTH="18">🔗</TD>'
+            label = (
+                f'<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2">'
+                f'<TR><TD ALIGN="left">{safe_node}</TD>{link_cell}</TR>'
+                f'</TABLE>>'
+            )
+            base_attrs.append(f'label={label}')
+            lines.append(f'  "{node}" [{", ".join(base_attrs)}];')
+        else:
+            # No outbound link configured → plain label
+            lines.append(f'  "{node}" [{", ".join(base_attrs)}];')
 
     # render external nodes (keep dashed/ellipse style)
     for node in sorted(external_nodes):
@@ -1902,6 +1914,7 @@ def emit_dot(
         '    l_cycle [label="Cycle Node", shape=doublecircle, color=red, penwidth=2];',
         '    l_edge [label="Internal Edge", shape=point, width=0.1];',
         '    l_extedge [label="External Edge (dashed)", shape=point, width=0.1];',
+        '    l_link [label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2"><TR><TD>Clickable</TD><TD>🔗</TD></TR></TABLE>>];',
         '  }'
     ]
     

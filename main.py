@@ -1769,11 +1769,19 @@ class AnalysisRunner:
         return dependencies_result
 
 
-def _make_tooltip(func_info, max_src_lines=12):
+def _make_tooltip(func_info, max_src_lines=20):
     """Generate tooltip text with function signature, location, and source preview"""
+    
     src = func_info.source_code.splitlines()
-    preview = "\n".join(src[:max_src_lines])
+    # Show full function code if max_src_lines is None or 0, otherwise limit
+    if max_src_lines and max_src_lines > 0:
+        preview = "\n".join(src[:max_src_lines])
+        if len(src) > max_src_lines:
+            preview += f"\n... ({len(src) - max_src_lines} more lines)"
+    else:
+        preview = "\n".join(src)
     tip = f"{func_info.signature}\n{func_info.file_path}:{func_info.line_number}\n\n{preview}"
+    
     # HTML escape and then escape newlines for DOT format
     escaped = html.escape(tip, quote=True)
     # Replace actual newlines with \n for DOT syntax
@@ -1786,7 +1794,8 @@ def emit_dot(
     external_edges: Dict[str, Set[str]] = None,
     cycle_nodes: Optional[List[str]] = None,
     func_map: Optional[Dict[str, Any]] = None,
-    link_mode: Optional[Tuple[str, str]] = None
+    link_mode: Optional[Tuple[str, str]] = None,
+    tooltip_lines: int = 20
 ) -> str:
     """Emit dependencies as Graphviz DOT format with rich styling and interactive features
     
@@ -1830,7 +1839,8 @@ def emit_dot(
         # add tooltip and links if func_map provided
         if func_map and node in func_map:
             fi = func_map[node]
-            tooltip = _make_tooltip(fi)
+            max_lines = tooltip_lines if tooltip_lines > 0 else None
+            tooltip = _make_tooltip(fi, max_src_lines=max_lines)
             attrs.append(f'tooltip="{tooltip}"')
 
             if link_mode:
@@ -1918,6 +1928,14 @@ Examples:
                        help='Minimize output (only errors and results)')
     parser.add_argument('--emit', choices=['text', 'json', 'dot'], default='text',
                        help='Output format: text (human-readable), json (structured), dot (Graphviz)')
+    parser.add_argument('--no-links', action='store_true',
+                       help='Disable clickable links in DOT output (VS Code links are enabled by default)')
+    parser.add_argument('--vscode-links', action='store_true',
+                       help='Enable VS Code clickable links in DOT output (default behavior)')
+    parser.add_argument('--github-links', type=str, metavar='REPO_URL',
+                       help='Enable GitHub clickable links instead of VS Code (e.g., https://github.com/user/repo/blob/main)')
+    parser.add_argument('--tooltip-lines', type=int, default=20, metavar='N',
+                       help='Limit tooltip code to N lines (0 = show full function, default: 20)')
     
     args = parser.parse_args()
     
@@ -1978,9 +1996,19 @@ Examples:
             # Get analyzer for function info tooltips
             analyzer = result.get('analyzer')
             func_map = analyzer.func_by_qname if analyzer else None
-            # TODO: Add CLI args for link_mode if desired
+            
+            # Configure clickable links (VS Code by default, unless disabled or overridden)
             link_mode = None
-            output = emit_dot(edges, start_node, external_edges, cycle_nodes, func_map, link_mode)
+            if not args.no_links:
+                if args.github_links:
+                    link_mode = ("github", args.github_links)
+                else:
+                    # VS Code links by default for better UX
+                    project_root = os.path.abspath('.')
+                    link_mode = ("vscode", project_root)
+            
+            output = emit_dot(edges, start_node, external_edges, cycle_nodes, func_map, link_mode,
+                             tooltip_lines=args.tooltip_lines)
     elif args.emit == 'text':
         output = _format_text_output(result)
     else:

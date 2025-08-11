@@ -111,8 +111,9 @@ BUILTIN_METHODS = {
     'sort', 'count', 'index', 'replace', 'split', 'join', 'strip',
     'startswith', 'endswith', 'lower', 'upper', 'title', 'capitalize',
     'format', 'encode', 'decode', 'find', 'rfind', 'isdigit', 'isalpha',
-    'isupper', 'islower', 'isspace', 'exists', 'read', 'write', 'close',
+    'isupper', 'islower', 'isspace', 'read', 'write', 'close',
     'appendleft', 'popleft', 'setdefault'
+    # NOTE: Removed 'exists' as it conflicts with os.path.exists, pathlib.Path.exists, etc.
 }
 
 # Built-in functions that should be tracked as dependencies
@@ -416,11 +417,47 @@ class PythonDependencyAnalyzer:
             # Simply return the functions - let callers handle storage via _store_functions
             return analyzer.functions
             
-        except (SyntaxError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-            logging.warning(f"Could not parse {file_path}: {e}")
+        except SyntaxError as e:
+            logging.warning(f"Syntax error in {file_path}:{e.lineno}:{e.offset}: {e.msg}")
             if hasattr(self, '_analysis_stats'):
                 with self._lock:
                     self._analysis_stats['skipped_files'] += 1
+                    self._analysis_stats.setdefault('syntax_errors', []).append(str(file_path))
+            return []
+        except UnicodeDecodeError as e:
+            logging.warning(f"Encoding error in {file_path}: {e}")
+            # Try with different encodings as fallback
+            for encoding in ['latin1', 'cp1252', 'iso-8859-1']:
+                try:
+                    with open(full_path, 'r', encoding=encoding) as f:
+                        source = f.read()
+                    tree = ast.parse(source)
+                    analyzer = _PythonASTAnalyzer(relative_path, source, tree)
+                    analyzer.visit(tree)
+                    logging.info(f"Successfully parsed {file_path} with {encoding} encoding")
+                    return analyzer.functions
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+            logging.warning(f"Could not decode {file_path} with any supported encoding")
+            if hasattr(self, '_analysis_stats'):
+                with self._lock:
+                    self._analysis_stats['skipped_files'] += 1
+                    self._analysis_stats.setdefault('encoding_errors', []).append(str(file_path))
+            return []
+        except (FileNotFoundError, OSError, PermissionError) as e:
+            logging.warning(f"File system error with {file_path}: {e}")
+            if hasattr(self, '_analysis_stats'):
+                with self._lock:
+                    self._analysis_stats['skipped_files'] += 1
+                    self._analysis_stats.setdefault('file_errors', []).append(str(file_path))
+            return []
+        except Exception as e:
+            # Catch any other unexpected errors to prevent complete failure
+            logging.error(f"Unexpected error parsing {file_path}: {type(e).__name__}: {e}")
+            if hasattr(self, '_analysis_stats'):
+                with self._lock:
+                    self._analysis_stats['skipped_files'] += 1
+                    self._analysis_stats.setdefault('unexpected_errors', []).append(str(file_path))
             return []
             
     def analyze_codebase(self) -> None:
@@ -501,12 +538,22 @@ class PythonDependencyAnalyzer:
             self._store_functions(functions)
             
     def _analyze_files_parallel(self, python_files: List[str]) -> None:
-        """Analyze files in parallel (for large codebases)"""
+        """Analyze files in parallel (for large codebases) with resource monitoring"""
         max_workers = min(DEFAULT_MAX_WORKERS, len(python_files))  # Use constant
         total_files = len(python_files)
         processed_files = 0
         
-        logging.info(f"Using {max_workers} parallel workers for analysis...")
+        logging.info(f"Using {max_workers} parallel workers for {total_files} files...")
+        
+        # Add optional memory monitoring for large codebases
+        try:
+            import psutil
+            process = psutil.Process()
+            initial_memory = process.memory_info().rss / (1024 * 1024)  # MB
+            memory_monitoring = True
+        except ImportError:
+            memory_monitoring = False
+            initial_memory = 0
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all file analysis tasks
@@ -523,10 +570,20 @@ class PythonDependencyAnalyzer:
                     self._store_functions(functions)
                     processed_files += 1
                     
-                    # Progress reporting for large codebases
+                    # Progress reporting with memory monitoring for large codebases
                     if processed_files % 50 == 0 or processed_files == total_files:
                         progress = (processed_files / total_files) * 100
-                        logging.info("Progress: %d/%d files analyzed (%.1f%%)", processed_files, total_files, progress)
+                        
+                        if memory_monitoring:
+                            try:
+                                current_memory = process.memory_info().rss / (1024 * 1024)  # MB
+                                memory_delta = current_memory - initial_memory
+                                logging.info("Progress: %d/%d files (%.1f%%), Memory: %.1fMB (+%.1fMB)", 
+                                           processed_files, total_files, progress, current_memory, memory_delta)
+                            except:
+                                logging.info("Progress: %d/%d files analyzed (%.1f%%)", processed_files, total_files, progress)
+                        else:
+                            logging.info("Progress: %d/%d files analyzed (%.1f%%)", processed_files, total_files, progress)
                         
                 except Exception as e:
                     logging.warning(f"Error processing {file_path}: {e}")
@@ -577,9 +634,27 @@ class PythonDependencyAnalyzer:
                 mod = self.module_of[q]
                 self.module_aliases.setdefault(mod, {}).update(func.source_aliases)
                 
-            # Update stats
+            # Update stats with detailed metrics
             if hasattr(self, '_analysis_stats'):
                 self._analysis_stats['parsed_functions'] = len(self.functions)
+                # Track function distribution by module
+                module_stats = {}
+                class_stats = {}
+                # FIXED: Iterate over values, not keys
+                for func in self.functions.values():
+                    mod = self.module_of.get(func.name, 'unknown')
+                    cls = self.class_of.get(func.name, 'none')
+                    module_stats[mod] = module_stats.get(mod, 0) + 1
+                    if cls:
+                        class_stats[cls] = class_stats.get(cls, 0) + 1
+                
+                self._analysis_stats['modules'] = len(module_stats)
+                self._analysis_stats['classes'] = len(class_stats)
+                self._analysis_stats['top_modules'] = sorted(module_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+                
+                # Log detailed stats periodically
+                if len(self.functions) % 1000 == 0:
+                    logging.debug(f"Analysis stats: {len(self.functions)} functions across {len(module_stats)} modules")
                 
     def find_function_dependencies(self, function_name: str, organize_by_levels: bool = False) -> Dict[str, Any]:
         """Find all dependencies for a function in correct order, optionally organized by levels"""
@@ -972,8 +1047,27 @@ class PythonDependencyAnalyzer:
         if scope == 'UNSCOPED' and short in BUILTIN_FUNCTIONS:
             return f"builtins.{short}"
 
-        # Skip common instance methods we never want to follow
+        # FIXED: Don't skip self/cls methods - these could be internal class methods!
+        # Instead, try to resolve them first, only skip if definitely external
         if scope == 'OBJ' and owner in ['self', 'cls']:
+            # Try to resolve as internal class method first
+            if owner == 'self':
+                # Look for instance method in same class
+                caller_parts = caller_qname.split('.')
+                if len(caller_parts) >= 2:  # e.g., "module.Class.method"
+                    class_qname = '.'.join(caller_parts[:-1])  # "module.Class"
+                    potential_method = f"{class_qname}.{short}"
+                    if potential_method in self.func_by_qname:
+                        return potential_method
+            elif owner == 'cls':
+                # Look for class method - similar logic
+                caller_parts = caller_qname.split('.')
+                if len(caller_parts) >= 2:
+                    class_qname = '.'.join(caller_parts[:-1])
+                    potential_method = f"{class_qname}.{short}"
+                    if potential_method in self.func_by_qname:
+                        return potential_method
+            # If not found as internal method, then skip
             return None
 
         # Don't blanket-skip names like 'exists'—they may be stdlib (e.g., os.path.exists).
@@ -1009,7 +1103,24 @@ class PythonDependencyAnalyzer:
             if not any(target.startswith(prefix) for prefix in self.project_prefixes):
                 return target
                 
-        # 3. Check module.function pattern for externals
+        # PRIORITY CHECK: Always check internal modules FIRST before stdlib
+        # This prevents misclassifying internal modules as external
+        if scope == 'OBJ' and owner:
+            # 1. Check if owner.short exists as an internal function first
+            for prefix in self.project_prefixes:
+                potential_internal = f"{prefix}.{owner}.{short}"
+                if potential_internal in self.func_by_qname:
+                    return potential_internal
+                    
+            # 2. Check if owner is an alias pointing to an internal module
+            if owner in aliases:
+                target_mod = aliases[owner]
+                if any(target_mod.startswith(prefix) for prefix in self.project_prefixes):
+                    potential_internal = f"{target_mod}.{short}"
+                    if potential_internal in self.func_by_qname:
+                        return potential_internal
+        
+        # 3. Check module.function pattern for externals (only after internal check)
         if scope == 'OBJ' and owner in aliases:
             target_mod = aliases[owner]
             if not any(target_mod.startswith(prefix) for prefix in self.project_prefixes):
@@ -1067,21 +1178,24 @@ class PythonDependencyAnalyzer:
         """Try to resolve constructor calls for class instantiation"""
         init_targets = []
         
-        # Handle relative targets
-        if not target.startswith(tuple(self.project_prefixes)):
+        # FIXED: Handle absolute vs relative targets correctly
+        # If target already starts with project prefix, it's already absolute
+        if target.startswith(tuple(self.project_prefixes)):
+            # Absolute target: e.g., "test.models.UserService" -> "test.models.UserService.__init__"
+            init_target = f"{target}.__init__"
+            if init_target in self.func_by_qname and self._is_internal(init_target):
+                # Additional validation: ensure this looks like a constructor
+                if self._is_likely_constructor(self.func_by_qname[init_target]):
+                    init_targets.append(init_target)
+        else:
+            # Relative target: try with each project prefix
+            # e.g., "UserService" -> "test.models.UserService.__init__"
             for prefix in self.project_prefixes:
                 abs_target = f"{prefix}.{target}.__init__"
                 if abs_target in self.func_by_qname and self._is_internal(abs_target):
                     # Additional validation: ensure this looks like a constructor
                     if self._is_likely_constructor(self.func_by_qname[abs_target]):
                         init_targets.append(abs_target)
-        else:
-            # Absolute target
-            init_target = f"{target}.__init__"
-            if init_target in self.func_by_qname and self._is_internal(init_target):
-                # Additional validation: ensure this looks like a constructor
-                if self._is_likely_constructor(self.func_by_qname[init_target]):
-                    init_targets.append(init_target)
                 
         return init_targets
     
@@ -1183,13 +1297,21 @@ class _CallFinder(ast.NodeVisitor):
                     
                     # For complex chains like os.path.exists, we want to capture
                     # the immediate parent as the owner: path.exists
+                    # FIXED: Use consistent indexing for chain parts
                     if len(chain_parts) >= 2:
-                        owner = chain_parts[-1]  # 'path' in os.path.exists
-                        # NEW: skip common built-in container methods to avoid false externals
+                        # chain_parts = ['os', 'path'] for os.path.exists
+                        owner = chain_parts[-1]  # 'path' (immediate parent)
+                        # Skip common built-in container methods to avoid false externals
                         if method_name in BUILTIN_METHODS or method_name in BUILTIN_ATTRS:
                             return
                         full_call = f"{owner}.{method_name}"
                         self.calls.add(full_call)
+                    elif len(chain_parts) == 1:
+                        # Single level: obj.method()
+                        owner = chain_parts[0]
+                        if method_name not in BUILTIN_METHODS and method_name not in BUILTIN_ATTRS:
+                            full_call = f"{owner}.{method_name}"
+                            self.calls.add(full_call)
             else:
                 # Only add the method name if it's likely a user-defined method
                 method_name = node.func.attr
@@ -1264,10 +1386,19 @@ class _ImportFinder(ast.NodeVisitor):
                 continue  # Skip processing the '*'
             
             local = alias.asname or alias.name
-            # from pkg.utils import foo as bar => 'pkg.utils.foo'
-            target = f"{base}.{alias.name}" if base else alias.name
+            # FIXED: Handle relative imports and empty base correctly
+            # from pkg.utils import foo as bar => local='bar', target='pkg.utils.foo'
+            # from .utils import foo => local='foo', target='.utils.foo' (relative)
+            if base:
+                target = f"{base}.{alias.name}"
+                full_import = f"{base}.{alias.name}"
+            else:
+                # Bare import: from __future__ import annotations
+                target = alias.name
+                full_import = alias.name
+            
             self.aliases[local] = target
-            self.imports.add(f"{base}.{alias.name}" if base else alias.name)
+            self.imports.add(full_import)
         self.generic_visit(node)
 
 
@@ -1404,8 +1535,18 @@ class _PythonASTAnalyzer(ast.NodeVisitor):
             if c.startswith('self.') or c.startswith('cls.'):
                 normalized.add(DependencyInfo(c.split('.', 1)[1], 'CLASS_LOCAL'))
             elif '.' in c:
-                owner, meth = c.split('.', 1)
-                normalized.add(DependencyInfo(meth, 'OBJ', owner))  # keep owner!
+                # FIXED: Use rsplit to get the last method name for complex chains
+                # For "os.path.exists", we want owner="os.path", method="exists"
+                # For "obj.method", we want owner="obj", method="method"  
+                parts = c.split('.')
+                if len(parts) == 2:
+                    owner, method = parts
+                    normalized.add(DependencyInfo(method, 'OBJ', owner))
+                else:
+                    # Complex chain - treat as single owner.method pattern
+                    method = parts[-1]
+                    owner = '.'.join(parts[:-1])
+                    normalized.add(DependencyInfo(method, 'OBJ', owner))
             else:
                 normalized.add(DependencyInfo(c, 'UNSCOPED'))
 
@@ -1762,15 +1903,33 @@ class AnalysisRunner:
         elif len(matching_functions) == 1:
             found_function_name = matching_functions[0]
         else:
-            # Multiple matches - treat as ambiguous
+            # Multiple matches - provide ranked candidates based on context
+            # Prioritize: 1) Exact match, 2) Module match, 3) Shorter names, 4) Alphabetical
+            def rank_candidate(candidate_name):
+                score = 0
+                # Exact match gets highest priority
+                if candidate_name == function_name:
+                    score += 1000
+                # Prefer functions in main/common modules
+                if any(module in candidate_name for module in ['main', 'models', 'api', 'core']):
+                    score += 100
+                # Prefer shorter qualified names (less deeply nested)
+                score -= len(candidate_name.split('.')) * 10
+                # Alphabetical tie-breaking
+                score -= ord(candidate_name[0]) if candidate_name else 0
+                return score
+            
+            ranked_candidates = sorted(matching_functions, key=rank_candidate, reverse=True)
+            
             return {
                 'dependency_order': [],
                 'detailed_dependencies': [],
                 'total_dependencies': 0,
                 'analysis_method': 'ambiguous_function',
                 'ambiguous_function': True,
-                'candidates': matching_functions[:10],  # Limit to first 10
+                'candidates': ranked_candidates[:10],  # Limit to first 10
                 'error': f'Function name "{function_name}" is ambiguous. Multiple matches found.',
+                'help_text': 'Please specify the fully qualified name (e.g., test.models.UserRepository.save)',
                 'analyzer': analyzer
             }
         

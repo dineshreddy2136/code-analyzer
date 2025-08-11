@@ -1841,24 +1841,21 @@ def emit_dot(
 
     # render internal nodes with tooltips/links
     for node in sorted(internal_nodes):
-        base_attrs = ['shape=box', 'fontsize=10']
+        attrs = ['shape=box', 'fontsize=10']
         
         # styling based on node type
         if node == start:
-            base_attrs += ['style=filled', 'fillcolor=lightblue']
+            attrs += ['style=filled', 'fillcolor=lightblue']
         elif node in cycle_nodes:
-            base_attrs += ['shape=doublecircle', 'color=red', 'penwidth=2']
-            
-        # Tooltip (code preview)
-        tip = None
-        fi = None
-        if func_map and node in func_map:
-            fi = func_map[node]
+            attrs += ['shape=doublecircle', 'color=red', 'penwidth=2']
+
+        fi = func_map.get(node) if func_map else None
+        if fi:
             max_lines = tooltip_lines if tooltip_lines > 0 else None
             tip = _make_tooltip(fi, max_src_lines=max_lines)
-            base_attrs.append(f'tooltip="{tip}"')
+            attrs.append(f'tooltip="{tip}"')
 
-        # Build href (but we won't set it on the node—only on the small icon cell)
+        # Build href for VS Code/GitHub links
         href = None
         if fi and link_mode:
             kind, base = link_mode
@@ -1868,19 +1865,21 @@ def emit_dot(
                 href = f'{base.rstrip("/")}/{fi.file_path}#L{fi.line_number}'
 
         if href:
-            # HTML-like label with a small right-aligned clickable cell
+            # Use HTML-like label with table and clickable icon cell
             safe_node = html.escape(node, quote=True)
-            link_cell = f'<TD HREF="{href}" TARGET="_top" PORT="link" ALIGN="right" WIDTH="18">🔗</TD>'
+            link_cell = f'<TD HREF="{href}" TARGET="_top" BGCOLOR="lightgray" WIDTH="20" ALIGN="center">🔗</TD>'
             label = (
-                f'<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2">'
-                f'<TR><TD ALIGN="left">{safe_node}</TD>{link_cell}</TR>'
+                f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">'
+                f'<TR><TD ALIGN="left" BORDER="0">{safe_node}</TD>{link_cell}</TR>'
                 f'</TABLE>>'
             )
-            base_attrs.append(f'label={label}')
-            lines.append(f'  "{node}" [{", ".join(base_attrs)}];')
+            attrs.append(f'label={label}')
         else:
-            # No outbound link configured → plain label
-            lines.append(f'  "{node}" [{", ".join(base_attrs)}];')
+            # No link configured → plain label
+            safe_node = html.escape(node, quote=True)
+            attrs.append(f'label="{safe_node}"')
+
+        lines.append(f'  "{node}" [{", ".join(attrs)}];')
 
     # render external nodes (keep dashed/ellipse style)
     for node in sorted(external_nodes):
@@ -1914,7 +1913,7 @@ def emit_dot(
         '    l_cycle [label="Cycle Node", shape=doublecircle, color=red, penwidth=2];',
         '    l_edge [label="Internal Edge", shape=point, width=0.1];',
         '    l_extedge [label="External Edge (dashed)", shape=point, width=0.1];',
-        '    l_link [label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2"><TR><TD>Clickable</TD><TD>🔗</TD></TR></TABLE>>];',
+        '    l_link [label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2"><TR><TD ALIGN="left">Open source</TD><TD>🔗</TD></TR></TABLE>>];',
         '  }'
     ]
     
